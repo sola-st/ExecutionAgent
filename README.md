@@ -4,6 +4,27 @@ The **Execution Agent** is an automated system that sets up, builds, and runs te
 
 ## Quick Start Guide
 
+### Setup
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/anthropics/execution-agent.git
+cd execution-agent
+
+# 2. Create and activate virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# 3. Install the package
+pip install -e .
+
+# 4. Set your API key
+export OPENAI_API_KEY="your-api-key-here"
+
+# 5. Run the agent (step mode for debugging)
+python -m execution_agent.main --experiment-file project_meta_data.json
+```
+
 ### Quick Start (Single Project)
 
 ```bash
