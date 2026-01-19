@@ -1,0 +1,53 @@
+## General Guidelines:
+**General Guidelines for Rust Projects**
+
+1. **Read the README**
+   Start by reading the project's README file on GitHub. It often contains important instructions for installation, usage, and any project-specific details.
+
+2. **Check Dependencies**
+   Look for dependencies listed in the README or in the `Cargo.toml` file. Ensure you have Rust and Cargo installed to manage these dependencies.
+
+3. **Install Dependencies**
+   Run the following command to build the project and install dependencies:
+   ```bash
+   cargo build
+   ```
+
+4. **Build the Project**
+   Use Cargo to build the project:
+   ```bash
+   cargo build --release
+   ```
+   Use `--release` for optimized builds, or omit it for debug builds with faster compilation.
+
+5. **Configuration**
+   Check if the project requires any configuration files (e.g., `.env` files, TOML configuration files) and set them up accordingly.
+
+6. **Run Tests (if available)**
+   If the project provides tests, run them to ensure everything is working correctly:
+   ```bash
+   cargo test
+   ```
+
+7. **Run the Project**
+   Follow the instructions in the README to run the project. Common commands include:
+   ```bash
+   cargo run
+   ```
+   or
+   ```bash
+   ./target/release/binary_name
+   ```
+
+8. **Troubleshooting**
+   If you encounter any issues during installation or while running the project, refer to the project's issue tracker on GitHub or search for similar issues others may have encountered.
+
+9. **Code Linting and Formatting**
+   Use Clippy for linting and rustfmt for formatting:
+   ```bash
+   cargo clippy
+   cargo fmt
+   ```
+
+10. **Test Suite Results**
+   When running a test suite, it is normal for some test cases to fail. If the percentage of failing test cases is less than 20% of the total number, it is considered acceptable, and further investigation is not necessary.

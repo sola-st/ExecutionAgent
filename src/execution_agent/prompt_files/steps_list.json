@@ -1,0 +1,32 @@
+{
+    "1": {
+        "static_header": "Determine the main language of the project (e.g., Python, Java, etc.) and its version (e.g., Python3.8, Java 17, C99, etc.)",
+        "step_line": "- Use 'linux_terminal' to list files and identify relevant files.\n- Read relevant files using 'read_file'.",
+        "result_of_step": []
+    },
+    "2": {
+        "static_header": "Based on the project's language, version, and other available information, create a container with an appropriate image that is suitable to install the project within.",
+        "step_line": "- Use 'write_to_file' to create the 'Dockerfile'.\n- The Dockerfile should always clone the target repository. Do not use the COPY command to transfer files from the host to the Docker image.\n- The script should enable pulling a Docker image, cloning the target repository inside it, installing dependencies, and running the project. Use 'write_to_file'.\nExample template of Dockerfile:\n```  FROM python:3.10-slim  # Adjust the base image based on the project's language and dependencies\n\n  # Avoid interruptive messages from tzdata\n  ENV TZ=Europe/Berlin\n  RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone\n\n  # Install git, gcc, bash, and other necessary build tools\n  RUN apt-get update && \\\n      apt-get install -y git gcc bash && \\\n      apt-get clean && \\\n      rm -rf /var/lib/apt/lists/* || exit 0\n\n  WORKDIR /app\n\n  # Clone the repository\n  RUN git clone project_git_url || exit 0\n\n  WORKDIR /app/project_name\n\n  CMD [\"bash\"]```\n\n- Notice how '|| exit 0' is added to some steps to avoid build failures in case of errors; you should do this when necessary.\n- Once the Dockerfile is created, an automatic attempt to execute it and create the image will start. You will receive a message about the success or failure of creating the Docker image.\n- If the Docker image is created successfully, all subsequent commands will be executed within the Docker container automatically.\n- Avoid including build and test steps as part of the Dockerfile to reduce errors during image creation.",
+        "result_of_step": []
+    },
+    "3": {
+        "static_header": "Gather project dependencies (required language SDK, packages, requirements, etc.)",
+        "step_line": "- Use already available information (from workflows, web search, previous attempts...) or obtain more from other files, links, etc.",
+        "result_of_step": []
+    },
+    "4": {
+        "static_header": "Set up the environment, such as adding modules to the PATH directive (e.g., JAVA_HOME) or creating a virtual environment for Python.",
+        "step_line": "- Use 'linux_terminal' to configure the environment.",
+        "result_of_step": []
+    },
+    "5": {
+        "static_header": "Install dependencies",
+        "step_line": "- Install the dependencies collected in Step 3 by executing commands through 'linux_terminal'.\n- Address any problems that arise using 'linux_terminal'.",
+        "result_of_step": []
+    },
+    "6": {
+        "static_header": "Identify the test framework and run tests.",
+        "step_line": "- Ensure the testing framework is installed and locate the test folder/files.\n- Launch the tests using 'linux_terminal'. Observe and debug problems.",
+        "result_of_step": []
+    }
+}

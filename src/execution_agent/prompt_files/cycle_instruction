@@ -1,0 +1,51 @@
+Determine exactly one command to execute next, drawing on:
+  - The high‐level goals and subgoals you’ve been given,
+  - The full history of commands, their outcomes, and reported working directories,
+  - Any errors or feedback observed in previous iterations,
+  - Your own expertise regarding robust build and debugging practices.
+
+Before choosing, perform a thorough, step‐by‐step analysis:
+  1. **Recall the last command executed and its working directory**: State the exact command you ran most recently, note the shell’s reported current working directory afterward (e.g., “/home/user/Project”), and summarize its result (success, failure, files created, etc.).
+  2. **Interpret that outcome**: What concrete information did it provide? Did it reveal missing files, dependencies, or configuration issues? How does that push progress toward the next subgoal?
+  3. **Update your mental model, including cwd context**: Describe how this latest result and working directory fit into the overall context. Which goals have been satisfied so far, and which remain? Are there new blockers or unknowns?
+  4. **Enumerate possible next commands**: List two or three plausible actions (e.g., “run cmake with out‐of‐source flags,” “inspect CMakeLists.txt,” “list a directory,” “install a missing library”). For each, state:
+     - **Expected outcome**: What you expect to learn or achieve,
+     - **Why it differs from previous attempts**: Why this choice avoids repeating past failures,
+     - **Potential pitfalls**: What could still go wrong given the current cwd.
+  5. **Select the single best command**: Explain why this one action is the most logical and likely to succeed now—referencing the exact files, error messages, or missing components you’ve observed, and the current working directory. Emphasize how it prevents repeating mistakes (e.g., avoiding in‐source builds, using the correct cwd).
+  6. **Describe how to run it robustly**: Include precise flags or arguments (e.g., `-S .. -B .`, disabling formatting checks, choosing Debug vs. Release) and explicitly confirm or change into the correct working directory so that this step anticipates and avoids prior pitfalls.
+
+Then, output only a JSON object matching this schema:
+
+```ts
+interface Response {
+  thoughts: string;     // Include the full reasoning from steps 1–6 in detailed prose, explicitly noting the cwd at each relevant point. (REQUIRED)
+  command: {            // REQUIRED   
+    name: string;       // The tool name, e.g., "linux_terminal" or "read_file". (REQUIRED)
+    args: Record<string, any>;  // The exact arguments for that tool, including any cd to change directory. (REQUIRED)
+  };
+}
+
+Here is an example of a command call that you can output (This is a fictional example to just show you the kind of expected response):
+
+{
+  "thoughts": "1. Recall of last command executed and working directory: The previous command was `python3 -m venv venv`, executed in `/home/user/AwesomeApp`. After it completed, the shell's prompt showed the cwd still as `/home/user/AwesomeApp`, and the `venv/` directory was created there.\n\n2. Interpretation of that outcome: The creation of `venv/` in `/home/user/AwesomeApp` confirms that the virtual environment was built correctly in the project root. No errors were reported, but no dependencies have yet been installed inside this environment.\n\n3. Updated mental model, including cwd context: We are currently located in `/home/user/AwesomeApp`. The repository is cloned, and the venv is set up. The `requirements.txt` file is in `/home/user/AwesomeApp/requirements.txt`. With the virtual environment directory present, our next subgoal is to install the packages listed in `requirements.txt` into the venv so that the application and tests can run.\n\n4. Possible next commands:\n   • `cd /home/user/AwesomeApp && source venv/bin/activate && pip install -r requirements.txt`:\n     - Expected outcome: Activates the venv in `/home/user/AwesomeApp`, then installs dependencies from `requirements.txt` into the virtual environment. This avoids missing-module errors when running the app or tests. Previous attempts did not have the venv activated, so pip would have installed globally or failed; now it will succeed in the correct environment.\n     - Potential pitfalls: If the `requirements.txt` references a package with native extensions (e.g., `psycopg2`), pip may fail due to missing system libraries. In that case, we will see explicit error messages indicating which Ubuntu packages need to be installed.\n\n   • `cd /home/user/AwesomeApp && read_file requirements.txt`:\n     - Expected outcome: Displays the contents of `requirements.txt`, allowing manual verification of required package names and versions. Since we already know its location and trust its format, this is lower priority and just delays installing.\n     - Potential pitfalls: None significant, but it does not move us toward actually installing the dependencies.\n\n   • `cd /home/user/AwesomeApp && source venv/bin/activate && pip install --upgrade pip setuptools`:\n     - Expected outcome: Ensures pip and setuptools are up to date inside the venv, reducing the chance of installation failures. This could avoid package build errors.\n     - Potential pitfalls: If pip and setuptools are already current, it's redundant. If `requirements.txt` contains packages requiring newer pip, a direct install with `-r` might upgrade pip automatically anyway.\n\n5. Selecting the single best command: Running `cd /home/user/AwesomeApp && source venv/bin/activate && pip install -r requirements.txt` is the most direct next step. We are already in `/home/user/AwesomeApp` (confirmed by cwd), and installing dependencies is required before any tests or application code can run. Inspecting the file is redundant since its location is known, and upgrading pip separately is unnecessary because pip will upgrade itself if needed during the install process. This combined command addresses the immediate blocker—missing packages—and will reveal any system package requirements.\n\n6. How to run it robustly: We explicitly `cd /home/user/AwesomeApp` to guarantee the cwd is correct. Then `source venv/bin/activate` ensures we are using the venv's pip. Finally, `pip install -r requirements.txt` installs exactly the dependencies listed. If any package fails, pip will output a clear error (e.g., missing headers), which we can address by installing a system package and rerunning the same command rather than redoing earlier steps incorrectly.\n",
+  "command": {
+    "name": "linux_terminal",
+    "args": {
+      "command": "cd /home/user/AwesomeApp && source venv/bin/activate && pip install -r requirements.txt"
+    }
+  }
+}
+
+**IMPORTANT REMINDER**: When using linux_terminal, provide commands directly WITHOUT shell wrappers like `bash -c`, `bash -lc`, `sh -c`, or similar. The system handles shell execution automatically. For example, use `ls -la` not `bash -lc 'ls -la'`.
+
+**IMPORTANT NOTE TO THE ASSISTANT: DO NOT OUTPUT ANY OTHER TEXT AROUND YOUR JSON RESPONSE.**
+
+**SUCCESS CRITERIA:**
+When evaluating test results, remember:
+- Your primary goal is to get the test suite running, not to achieve 100% pass rate
+- If ~80% or more of tests pass, the task is considered successful
+- Having a few failing tests or errors is acceptable and expected
+- Once you have a substantial majority of tests passing (~80%+), declare goals accomplished
+- Do NOT waste cycles trying to fix the last few failing tests - focus on getting most tests working

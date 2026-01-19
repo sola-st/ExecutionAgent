@@ -1,0 +1,99 @@
+## Tools
+
+1. **linux_terminal**: Execute commands within the Linux terminal.
+   * Example: `{"command": {"name": "linux_terminal", "args": {"command": "ls"}}}`
+
+   **CRITICAL: Keep commands SIMPLE and DIRECT**
+   - Commands are executed directly in a shell - DO NOT wrap them with `bash`, `sh`, or any shell invocation
+   - WRONG: `bash -lc 'pwd'` or `sh -c 'ls'` or `/bin/bash -c 'command'`
+   - RIGHT: `pwd` or `ls` or `command`
+   - The system automatically handles shell execution - adding wrappers will cause errors
+
+   **IMPORTANT CONSTRAINTS:**
+
+   *Before Docker container is created (Pre-container mode):*
+   - ONLY these commands are allowed: `tree`, `ls`, `cat`, `head`, `tail`, `more`, `less`, `grep`, `find`
+   - NO piping (`|`), redirection (`>`, `<`), chaining (`&`, `;`, `&&`, `||`), command substitution (`` ` ``), or variables (`$`)
+   - `find` with `-exec` or `-ok` flags is NOT allowed
+   - `bash`, `sudo`, `rm`, and running `SETUP_AND_INSTALL.sh` are blocked
+   - To get more command capabilities, you MUST first write a Dockerfile which will create a container
+
+   *After Docker container is created (In-container mode):*
+   - Interactive editors like `nano`, `vim`, `vi` are NOT allowed - use `write_to_file` instead
+   - `ls -R` is NOT allowed (too verbose) - use `find` or `tree` instead
+   - Using `~` in paths is NOT allowed - always use ABSOLUTE PATHS (e.g., `/app/project/file.txt`)
+   - `su -` is NOT allowed - use `sudo` if needed, or run commands directly
+   - `sed -i` is NOT allowed - use `write_to_file` tool to modify files
+   - `docker` commands are NOT allowed inside the container
+   - Commands that previously got stuck will be blocked - try a different approach
+   - Keep commands simple - avoid unnecessary shell wrappers like `bash -c` or `sh -lc`
+
+   *Command Timeout/Stuck Handling:*
+   - If a command produces no output for ~10 minutes, it is considered "stuck"
+   - When stuck, you have three options:
+     - `WAIT` - Wait more time for the command to complete
+     - `TERMINATE` - Kill the stuck command and reset the terminal
+     - `WRITE:<input>` - Send input to the command (e.g., `WRITE:y` to answer a prompt)
+
+   *General Tips:*
+   - Always use `-y` flag (or equivalent) for commands that require confirmation (e.g., `apt install -y`)
+   - The terminal starts in the project folder - do NOT include project name in paths
+   - To reinitialize the shell (like opening a new terminal), run: `exec "$SHELL" -l`
+   - The `echo` command is strictly prohibited - use `write_to_file` instead
+
+2. **read_file**: Read a file's contents.
+   * Example: `{"command": {"name": "read_file", "args": {"file_path": "src/main.py"}}}`
+
+   **CONSTRAINTS:**
+   - In container mode: relative paths are assumed to be under `/app/<project_path>/`
+   - If reading from a different location, use an absolute path (e.g., `/app/project/src/file.py`)
+   - XML files are automatically converted to YAML format for better readability
+
+3. **write_to_file**: Write text content into a file.
+   * Example: `{"command": {"name": "write_to_file", "args": {"filename": "config.json", "text": "{\"key\": \"value\"}"}}}`
+   * Args: `filename` (string) and `text` (string)
+
+   **IMPORTANT - Proper JSON Formatting for Multi-line Text:**
+   - When writing multi-line content (like Dockerfiles), use `\n` (single backslash-n) in your JSON string
+   - CORRECT: `"text": "FROM python:3.12\nRUN apt-get update\nWORKDIR /app"`
+   - WRONG: `"text": "FROM python:3.12\\nRUN apt-get update\\nWORKDIR /app"` (double backslash)
+   - The system will automatically convert `\n` to actual newlines in the file
+
+   **CONSTRAINTS:**
+
+   *For Dockerfiles:*
+   - The `COPY` instruction is PROHIBITED - use `git clone` or `wget`/`curl` to get files
+   - Dockerfile CANNOT be written after a container is already running - fix issues inside the existing container
+   - Maximum 100 lines or 100 RUN commands allowed
+   - Writing a Dockerfile will automatically trigger: build image -> start container
+
+   *For other files:*
+   - In local mode (pre-container): absolute paths are NOT allowed
+   - In container mode: relative paths use the current working directory as base
+   - Ensure the target directory exists before writing (create with `mkdir -p` if needed)
+
+4. **search_docker_image**: Search for Docker images on Docker Hub.
+   * Example: `{"command": {"name": "search_docker_image", "args": {"search_term": "python 3.10 alpine"}}}`
+
+   **CONSTRAINTS:**
+   - Requires a non-empty search term
+   - Returns up to 20 results with name, description, star count, and official/automated flags
+   - Use this to find pre-built images with specific tools (e.g., "jdk8 maven", "node alpine", "python slim")
+
+5. **goals_accomplished**: Signal that all tasks are complete.
+   * Example: `{"command": {"name": "goals_accomplished", "args": {"reason": "Test suite executed: 45/50 tests passed (90%). Results written to test_results.txt"}}}`
+   * Args: `reason` (string) - explain what was accomplished
+
+   **CONSTRAINTS:**
+   - ONLY call this when:
+     - Tests have been successfully triggered and executed
+     - Test results have been observed and documented
+     - All required setup steps are complete
+   - Do NOT call prematurely - ensure tests actually ran and results are available
+
+   **SUCCESS CRITERIA FOR TESTS:**
+   - The task is considered successful if ~80% or more of the tests pass
+   - Having a few failing tests or errors is acceptable and expected
+   - You should declare goals accomplished once a substantial portion (~80%+) of tests run successfully
+   - Do NOT spend excessive time perfecting the setup to fix the last few failing tests
+   - Focus on getting the majority of tests running rather than achieving 100% pass rate

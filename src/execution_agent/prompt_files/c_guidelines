@@ -1,0 +1,481 @@
+## General Guidelines : 
+**General C/C++ Project Guidelines**
+
+```
+**General C/C++ Project Guidelines**
+
+1. **Read README**
+
+   * Contains install, usage, and project-specific notes.
+
+2. **Check Dependencies**
+
+   * Look in README, `CMakeLists.txt`, `Makefile`, or `vcpkg.json`.
+   * Install required compiler and “-dev” packages.
+
+3. **Identify Build Tool**
+
+   * Find `Makefile` (Make) or `CMakeLists.txt` (CMake).
+
+4. **Build**
+
+   * **Make**:
+
+     ```bash
+     make
+     ```
+   * **CMake** (out-of-source):
+
+     ```bash
+     mkdir -p build && cd build
+     cmake ..            # add -DCMAKE_BUILD_TYPE=Debug/Release or -G Ninja as needed
+     make -j$(nproc)
+     ```
+
+5. **Configuration**
+
+   * Check for `.conf` or `config.h`.
+   * Pass paths/flags if needed, e.g. `-DFoo_DIR=/path`.
+
+6. **Run Tests**
+
+   * **CTest**:
+
+     ```bash
+     ctest --output-on-failure
+     ```
+   * Or run test executables directly.
+
+7. **Run Executable**
+
+   * Follow README (e.g., `./myapp` or server start commands).
+
+8. **Troubleshoot**
+
+   * Search GitHub issues or web.
+   * Rebuild clean, enable verbose (`make VERBOSE=1`, `ninja -v`), grep for “error:”/“warning:”.
+
+9. **Documentation**
+
+   * Read Doxygen/API docs or inline comments for structure and usage.
+
+---
+
+**Make/CMake–Specific Guide**
+
+### 1. Basic Workflow
+
+1. **Locate Build Files**
+
+   * CMake: top-level `CMakeLists.txt`.
+   * Make: root or subdirectory `Makefile`.
+
+2. **Prepare Build Directory**
+
+   ```bash
+   mkdir -p build && cd build
+   # If it exists:
+   rm -rf CMakeCache.txt CMakeFiles/* 
+   ```
+
+3. **Configure (CMake)**
+
+   ```bash
+   cmake ..                       # default
+   cmake -DCMAKE_BUILD_TYPE=Debug ..
+   cmake -G Ninja ..              # if using Ninja
+   ```
+
+4. **Build**
+
+   * **Make**:
+
+     ```bash
+     make -j$(nproc)   # parallel
+     make -j1          # fail-fast
+     ```
+   * **Ninja**:
+
+     ```bash
+     ninja             # stops on first error
+     ninja -v          # verbose
+     ```
+
+5. **Run Tests**
+
+   ```bash
+   ctest -j$(nproc) --output-on-failure
+   ```
+
+   Or:
+
+   ```bash
+   make test   # or make check
+   ```
+
+   Custom runners: follow README or look in `tests/`.
+
+6. **Check Exit Codes**
+
+   * Nonzero from `make`/`ninja`/`ctest` → failure; inspect logs or verbosity.
+
+---
+
+### 2. Common CMake Issues
+
+1. **Cannot Find Package X**
+
+   * **Symptom**:
+
+     ```
+     CMake Error: find_package(Foo) didn't find Foo
+     ```
+   * **Fix**:
+
+     * Install “foo-dev” (e.g. `sudo apt-get install libfoo-dev`).
+     * Or:
+
+       ```bash
+       cmake -DFoo_DIR=/path/to/foo/cmake ..
+       cmake -DCMAKE_PREFIX_PATH=/opt/foo ..
+       ```
+
+2. **Stale Cache / Persisting Options**
+
+   * **Symptom**: Changes not applied; missing headers despite install.
+   * **Fix**:
+
+     ```bash
+     cd build
+     rm -rf CMakeCache.txt CMakeFiles
+     cmake ..
+     ```
+
+     Or override with `-DVAR=…` on the command line.
+
+3. **Missing/Incorrect Include Directories**
+
+   * **Symptom**:
+
+     ```
+     fatal error: bar.h: No such file or directory
+     ```
+   * **Fix**:
+
+     * Check `target_include_directories(...)`:
+
+       ```bash
+       grep -R "target_include_directories" -n ../CMakeLists.txt
+       ```
+     * Build verbosely to inspect `-I` flags:
+
+       ```bash
+       make VERBOSE=1   # or ninja -v
+       ```
+     * Test manually:
+
+       ```bash
+       g++ -I/path/to/bar/include -c foo.cpp
+       ```
+     * Then add e.g.
+
+       ```cmake
+       target_include_directories(myTarget PUBLIC /path/to/bar/include)
+       ```
+
+4. **Undefined Reference (Linker)**
+
+   * **Symptom**:
+
+     ```
+     undefined reference to `Bar::baz()`
+     ```
+   * **Fix**:
+
+     * Ensure `target_link_libraries(foo PRIVATE BarLib)` in CMake.
+     * For static libs:
+
+       ```bash
+       g++ foo.o -o foo libbar.a
+       ```
+     * Avoid circular static-library dependencies; split or use shared libs.
+
+5. **No Tests Found / CTest Shows 0 Tests**
+
+   * **Symptom**:
+
+     ```
+     No tests were found!!!
+     ```
+   * **Fix**:
+
+     * In `CMakeLists.txt`, enable tests if behind an option:
+
+       ```cmake
+       option(ENABLE_TESTS "Enable tests" OFF)
+       if(ENABLE_TESTS)
+         add_subdirectory(tests)
+       endif()
+       ```
+
+       Then:
+
+       ```bash
+       cmake -DENABLE_TESTS=ON ..
+       make && ctest --output-on-failure
+       ```
+     * Verify test executables in `build/tests/`.
+
+---
+
+### 3. Common Make Issues
+
+1. **Wrong Compiler Flags**
+
+   * **Symptom**:
+
+     ```
+     gcc: error: unrecognized command line option ‘-std=c++17’
+     ```
+   * **Fix**:
+
+     * Edit Makefile:
+
+       ```makefile
+       CXX := g++
+       CXXFLAGS := -Wall -Wextra -std=c++17
+       ```
+     * Or override:
+
+       ```bash
+       make CXX=clang++ CXXFLAGS="-std=c++17 -O2"
+       ```
+     * Ensure toolchain consistency:
+
+       ```bash
+       export CC=gcc CXX=g++
+       make clean && make
+       ```
+
+2. **Stale Builds / Missing Dependencies**
+
+   * **Symptom**: Header change doesn’t recompile dependent objects.
+   * **Fix**:
+
+     * Add auto-generated `.d` files:
+
+       ```makefile
+       SRCS := $(wildcard src/*.cpp)
+       DEPS := $(SRCS:.cpp=.d)
+       OBJS := $(SRCS:.cpp=.o)
+
+       -include $(DEPS)
+
+       %.o: %.cpp
+       	$(CXX) $(CXXFLAGS) -MMD -MF $(@:.o=.d) -c $< -o $@
+
+       myapp: $(OBJS)
+       	$(CXX) $(OBJS) -o $@ $(LDFLAGS)
+       ```
+     * If unmodifiable, force clean rebuild:
+
+       ```bash
+       make clean && make -j$(nproc)
+       ```
+
+       or delete objects:
+
+       ```bash
+       find . -name '*.o' -delete && make
+       ```
+
+3. **Parallel Race Conditions**
+
+   * **Symptom**:
+
+     ```
+     No rule to make target 'moduleA/libbar.a'
+     ```
+   * **Fix**:
+
+     * Confirm serial build:
+
+       ```bash
+       make -j1
+       ```
+     * Add missing dependencies in Makefile, e.g.:
+
+       ```makefile
+       moduleB/foo.o: ../moduleA/libbar.a
+       ```
+     * If no write access, build `-j1`.
+
+---
+
+### 4. Spotting Errors Quickly
+
+1. **Grep for Errors/Warnings**
+
+   ```bash
+   make -j$(nproc) 2>&1 | tee build.log | grep --color -i "error:\|warning:"
+   grep -n "error:" build.log
+   grep -n "warning:" build.log
+   ```
+
+2. **Enable Verbose Mode**
+
+   * **Make**: `make VERBOSE=1`
+   * **Ninja**: `ninja -v`
+
+3. **Fail-Fast Builds**
+
+   * **Make**:
+
+     ```bash
+     make -j1           # stops on first error
+     make -k -j$(nproc) # continues despite errors
+     ```
+   * **Ninja**: stops on first error by default.
+
+4. **CTest Output**
+
+   ```bash
+   ctest --output-on-failure
+   ```
+
+---
+
+### 5. Common Pitfalls & Prevention
+
+1. **Mixing Build Artifacts with Source**
+
+   * **Issue**: `.o` or generated files in source tree → clutter and stale artifacts.
+   * **Tip**: Always do out-of-source builds:
+
+     ```bash
+     mkdir build && cd build && cmake ../ && make
+     ```
+
+     If forced in-source, run `make clean` or delete files manually.
+
+2. **Silent Failures in Scripts/Tests**
+
+   * **Issue**: Test scripts hide exit codes (`set -e` missing).
+   * **Tip**:
+
+     ```bash
+     ./run_tests.sh 2>&1 | tee test_run.log
+     grep -i "fail" test_run.log
+     ```
+
+3. **Mismatched Compiler Versions/ABI**
+
+   * **Issue**: Project expects GCC 8 but system has GCC 5.
+   * **Tip**:
+
+     ```bash
+     cd build
+     grep "CMAKE_CXX_COMPILER" CMakeCache.txt
+     export CC=gcc-9 CXX=g++-9
+     cmake ..
+     make
+     ```
+
+     For Makefiles:
+
+     ```bash
+     make CC=gcc-9 CXX=g++-9
+     ```
+
+4. **Circular/Missing Submodule Dependencies**
+
+   * **Issue**: `moduleA` needs `moduleB` but scripts omit linkage.
+   * **Tip**:
+
+     * **Make**: add `moduleB/libB.a` as a prerequisite.
+     * **CMake**: `target_link_libraries(moduleA PUBLIC moduleB)`.
+     * If unmodifiable, build sequentially:
+
+       ```bash
+       (cd moduleB && make)
+       (cd moduleA && make)
+       ```
+
+5. **Outdated CMakeLists (Using `file(GLOB ...)`)**
+
+   * **Issue**: New `.cpp` files aren’t detected until CMake reruns.
+   * **Tip**:
+
+     ```bash
+     cd build
+     rm -rf CMakeCache.txt CMakeFiles
+     cmake ..
+     make -j$(nproc)
+     ```
+
+---
+
+### 6. Quick Error-Fix Recipes
+
+1. **“Could not find package XYZ”**
+
+   ```bash
+   sudo apt-get update
+   sudo apt-get install libxyz-dev
+   cd build
+   rm -rf CMakeCache.txt CMakeFiles
+   cmake ..
+   make -j$(nproc)
+   # If in custom prefix:
+   cmake -DCMAKE_PREFIX_PATH=/opt/xyz ..
+   ```
+
+2. **Missing Headers (“No such file or directory”)**
+
+   ```bash
+   cd build
+   make VERBOSE=1 2>&1 | tee verbose.log
+   grep -n "fatal error: .* No such file or directory" verbose.log
+   # Add missing include via CMakeLists or Makefile once identified.
+   ```
+
+3. **“Undefined Reference …” (Linker)**
+
+   ```bash
+   cd build
+   make VERBOSE=1 -j1 2>&1 | tee link.log
+   grep -n "undefined reference" link.log
+   # Ensure the library supplying the symbol appears after objects; adjust CMakeLists or rebuild.
+   ```
+
+4. **Tests Fail Silently (Exit Code 0 But Wrong Behavior)**
+
+   ```bash
+   cd build
+   ctest --output-on-failure | tee test.log
+   grep -i "fail" test.log
+   grep -i "error" test.log
+   # If none, run test binaries manually:
+   ./tests/test_moduleA
+   valgrind ./tests/test_moduleA
+   ```
+
+5. **CMake Not Picking Up New Files (`file(GLOB)`)**
+
+   ```bash
+   cd build
+   rm -rf CMakeCache.txt CMakeFiles
+   cmake ..
+   make -j$(nproc)
+   ```
+
+---
+
+### 7. Test Suite Results
+
+When running a test suite, it is normal for some test cases to fail. If the percentage of failing test cases is less than 20% of the total number, it is considered acceptable, and further investigation is not necessary.
+
+```
+---
+END OF LANGUAGE SPECIFIC GUIDELINES SETCTION
+---

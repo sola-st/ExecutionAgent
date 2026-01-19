@@ -1,0 +1,7 @@
+{
+  "linux_terminal": ["command"],
+  "read_file": ["file_path"],
+  "goals_accomplished": ["reason"],
+  "write_to_file": ["filename", "text"],
+  "search_docker_image": ["search_term"]
+}

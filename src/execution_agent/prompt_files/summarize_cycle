@@ -1,0 +1,13 @@
+Now, you have to summarize and extract important information from the output of the last command.
+
+Ensure accuracy and relevance, such as software versions, tool names, or lists of requirements.
+
+Your summary and extracted information (extracted dependencies, relevant installation commands, and important links) should have always the following JSON format:
+
+{
+    "summary": "... put summary here...e.g, a possible summary of 'ls' command would be: Project contains `README.rst`, `Dockerfile`, `pyproject.toml`... ",
+    "Setup details:": "Relevant dependencies: ... put newly inferred dependencies... e.g, command results shows that Python3.11 is necessary, or Java 17 is required instead of java 11. \nImportant commands: ...put the list of newly iferred commands that related to the process... e.g, executing init is required before... \nImportant files: ...put the list of files that are highlighted to be important... e.g, the results shows that the file... should be checked...",
+    "Meaningful next setps": "... Based on the result of the command and history of other commands put what would be the next 2 or 3 steps and why they matter in the grand scheme of setting up and installing the project"
+}
+
+Here is the result of the last command, fill in the json dictionary above from the information mentioned below (only extract from the information below, do not include information from above or information that was previously mentioned):

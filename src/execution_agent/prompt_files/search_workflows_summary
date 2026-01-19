@@ -1,0 +1,121 @@
+CONTEXT - THE OVERALL GOAL:
+We are building an automated system to INSTALL SOFTWARE PROJECTS FROM SOURCE CODE AND RUN THEIR TEST SUITES inside fresh Linux (Ubuntu) Docker containers.
+
+YOUR TASK:
+Analyze ALL the provided evidence (web pages, Dockerfiles, requirement files, CI/CD workflows, and README) for the project: {}. Create a CONCISE, STRUCTURED summary that guides an LLM agent through setting up and testing this project.
+
+OUTPUT FORMAT - Use these exact sections:
+
+================================================================================
+## 1. CRITICAL RULES (Always include these)
+================================================================================
+- DO NOT use '|| exit 0' in terminal commands. Only use it in Dockerfile RUN instructions.
+- DO NOT use docker commands in the terminal (e.g., "docker build", "docker run"). Write the Dockerfile to a file and the system handles building/running automatically.
+- Always install git SEPARATELY in the Dockerfile (on its own apt-get line) to prevent failures if other packages fail.
+
+## 2. DOCKERFILE TEMPLATE
+================================================================================
+```dockerfile
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=Europe/Berlin
+
+# Install git separately first
+RUN apt-get update && apt-get install -y git
+
+# Install other system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tzdata bash ca-certificates \
+    [ADD PROJECT-SPECIFIC PACKAGES HERE] \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ARG REPO_URL
+ARG PROJECT_DIR=project
+
+RUN test -n "$REPO_URL" && git clone --depth 1 "$REPO_URL" "$PROJECT_DIR"
+
+WORKDIR /app/${{PROJECT_DIR}}
+
+CMD ["/bin/bash"]
+```
+
+## 3. SYSTEM DEPENDENCIES (apt-get packages)
+================================================================================
+List all system packages that need to be installed via apt-get.
+Format: package_name - brief reason why needed (if known)
+
+[Extract from evidence: CI workflows, Dockerfiles, README install sections]
+
+## 4. LANGUAGE RUNTIME & VERSION
+================================================================================
+- Language: [e.g., Python 3.11, Node.js 18, Java 17, Rust stable]
+- How to install: [exact commands or package names]
+
+[Extract version requirements from: .python-version, .nvmrc, pyproject.toml, CI matrix, etc.]
+
+## 5. PROJECT DEPENDENCIES (language-specific)
+================================================================================
+List the commands to install project dependencies.
+- Primary method: [e.g., pip install -e ., npm install, cargo build]
+- Alternative methods: [if any]
+
+[Extract from: requirements.txt, package.json, Cargo.toml, setup.py, CI workflows]
+
+## 6. BUILD/SETUP STEPS
+================================================================================
+List the exact commands in order:
+1. [first command]
+2. [second command]
+...
+
+[Extract from: CI workflows, README, Makefile]
+
+## 7. TEST EXECUTION (MOST IMPORTANT)
+================================================================================
+Primary test command: [exact command]
+Alternative test commands: [if any]
+
+To run a subset of tests (for quick verification):
+- [command for running specific tests]
+
+Environment variables needed for tests:
+- VAR_NAME=value - reason
+
+[THIS IS THE PRIMARY GOAL - Extract from: CI workflows, README test sections, pytest.ini, package.json scripts]
+
+## 8. POTENTIAL ISSUES & ALTERNATIVES
+================================================================================
+- Issue: [potential problem]
+  Solution: [how to fix]
+
+- If X doesn't work, try Y because [reason]
+
+[Extract from: CI workflow workarounds, README troubleshooting, common issues mentioned]
+
+================================================================================
+## DISCLAIMER
+================================================================================
+NOTE: This information is gathered from multiple sources (web pages, repository files, CI configurations) and may be:
+- Incomplete or outdated
+- Specific to certain OS versions or configurations
+- Based on assumptions not documented
+
+The agent should:
+1. Use this as a starting point, not absolute truth
+2. Install additional packages/dependencies based on error feedback during execution
+3. Check error messages and adapt the approach accordingly
+4. The list of dependencies above may NOT be exhaustive - be prepared to install more as needed
+
+================================================================================
+
+EVIDENCE ANALYSIS GUIDELINES:
+- Prioritize information from CI/CD workflows (most reliable for automated builds)
+- Cross-reference README instructions with actual workflow files
+- Extract EXACT commands - don't paraphrase shell commands
+- Note any version-specific requirements or conflicts
+- If multiple approaches exist, list all with pros/cons
+- Be concise but include all actionable information

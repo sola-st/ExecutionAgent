@@ -1,0 +1,440 @@
+# Execution Agent
+
+The **Execution Agent** is an automated system that sets up, builds, and runs test suites for software projects inside Docker containers. It analyzes project requirements, creates appropriate Dockerfiles, and executes build/test commands.
+
+## Quick Start Guide
+
+### Quick Start (Single Project)
+
+```bash
+# 1. Set your API key
+export OPENAI_API_KEY="your-api-key"
+
+# 2. Create a project metadata file (project_meta_data.json)
+cat > project_meta_data.json << 'EOF'
+{
+  "project_path": "my_project",
+  "project_url": "https://github.com/username/my_project",
+  "language": "Python",
+  "budget": 40
+}
+EOF
+
+# 3. Run the agent
+python -m execution_agent.main \
+  --experiment-file project_meta_data.json \
+  --model gpt-4o-mini
+```
+
+### Using the Launcher (Multiple Projects)
+
+The launcher (`launcher.py`) simplifies running the agent on multiple pre-configured projects:
+
+```bash
+# List all available projects
+python launcher.py --list
+
+# List projects by language
+python launcher.py --list --language python
+
+# Run a single project
+python launcher.py --run scipy
+
+# Run multiple specific projects
+python launcher.py --run scipy,pandas,numpy
+
+# Run all Python projects
+python launcher.py --run python
+
+# Run all projects (50 total)
+python launcher.py --run all
+
+# Run with a specific model
+python launcher.py --run scipy --model gpt-4o
+
+# Run in parallel (4 projects simultaneously)
+python launcher.py --run python --parallel 4
+
+# Dry run (show what would be executed)
+python launcher.py --run all --dry-run
+
+# Verbose mode (show agent output in terminal)
+python launcher.py --run scipy --verbose
+```
+
+---
+
+## Output Files and Artifacts
+
+### Directory Structure
+
+After running the agent, outputs are organized as follows:
+
+```
+execution_agent_workspace/
+├── _run_logs/
+│   └── <project_name>/
+│       └── <timestamp>/           # Run directory
+│           ├── run.log            # Human-readable log
+│           ├── run.jsonl          # Structured JSON log
+│           ├── messages.json      # Full conversation history
+│           ├── messages_transcript.txt    # Text transcript
+│           ├── messages_transcript.jsonl  # JSONL transcript
+│           ├── replay_trace.sh    # Bash script to replay commands
+│           ├── tool_metrics.json  # Tool execution statistics
+│           ├── cycles_chats/      # Per-cycle LLM prompts
+│           │   ├── cycle_1/
+│           │   │   ├── prompt_1.json
+│           │   │   └── prompt_1.txt
+│           │   └── cycle_N/
+│           ├── success_artifacts/ # Generated on success
+│           │   ├── Dockerfile
+│           │   ├── commands.sh
+│           │   ├── launch.sh
+│           │   └── manifest.json
+│           └── forced_exit_cycle/ # If forced exit was used
+│               ├── Dockerfile
+│               ├── run_tests.sh
+│               └── test_output.log
+├── metadata/
+│   └── meta_<project>.json        # Project metadata files
+└── <project_name>/                # Cloned repository
+```
+
+### Log File Formats
+
+#### run.log (Human-Readable)
+```
+12:34:56 | INFO  | execution_agent | CYCLE 01 START
+12:34:57 | INFO  | execution_agent | Querying LLM for next action...
+12:35:02 | INFO  | execution_agent | CYCLE 01 TOOL: linux_terminal args={"command": "ls -la"}
+12:35:03 | INFO  | execution_agent | CYCLE 01 END
+```
+
+#### run.jsonl (Structured JSON)
+```json
+{"ts": "2024-01-15T12:34:56", "level": "INFO", "logger": "execution_agent", "message": "CYCLE 01 START", "event": "cycle_start"}
+{"ts": "2024-01-15T12:35:02", "level": "INFO", "logger": "execution_agent", "message": "CYCLE 01 TOOL: linux_terminal", "event": "cycle_tool", "tool_name": "linux_terminal", "tool_args": {"command": "ls -la"}}
+```
+
+#### messages.json (Conversation History)
+```json
+[
+  {"role": "system", "content": "You are an AI assistant...", "tag": null},
+  {"role": "user", "content": "Project path: scipy...", "tag": null},
+  {"role": "assistant", "content": "{\"thoughts\": \"...\", \"command\": {...}}", "tag": null}
+]
+```
+
+### Success Artifacts
+
+When the agent successfully completes a project, it generates reproducible artifacts in `success_artifacts/`:
+
+- **Dockerfile**: The working Dockerfile that was used
+- **commands.sh**: All bash commands executed inside the container
+- **launch.sh**: A self-contained script to rebuild and re-run everything
+- **manifest.json**: Metadata about the successful run
+
+To reproduce a successful run:
+```bash
+cd execution_agent_workspace/_run_logs/<project>/<timestamp>/success_artifacts/
+./launch.sh
+# Or keep the container running for debugging:
+./launch.sh --keep-container
+```
+
+### Forced Exit Artifacts
+
+When the agent exhausts its budget (all retries consumed) without calling `goals_accomplished`, it triggers a **forced exit cycle**. The LLM attempts to produce a final working solution based on all learned context. These artifacts are saved in `forced_exit_cycle/`:
+
+- **Dockerfile**: A Dockerfile generated by the knowledge model based on lessons learned
+- **run_tests.sh**: A bash script to build and run tests
+- **test_output.log**: Output from attempting to run the generated solution
+- **docker_build.log**: Docker build output (if build failed)
+
+These artifacts may or may not represent a successful run - they are the agent's best effort after exhausting the budget. Review them to:
+- Extract partial solutions that might work with minor adjustments
+- Observe the progress obtained so far by the agent
+
+```bash
+# Check the forced exit artifacts
+cd execution_agent_workspace/_run_logs/<project>/<timestamp>/forced_exit_cycle/
+cat test_output.log  # See if tests actually ran
+```
+
+---
+
+## Advanced Usage
+
+### Command-Line Options
+
+#### Main Agent (`python -m execution_agent.main`)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--experiment-file` | Path to project metadata JSON (required) | - |
+| `--task-file` | Optional file with custom task instructions | - |
+| `--task` | Optional task string (overrides --task-file) | Auto-generated |
+| `--model` | LLM model to use | `gpt-5-nano` |
+| `--knowledge-model` | Model for web search and summaries | `gpt-5-mini` |
+| `--api-key` | OpenAI API key | `$OPENAI_API_KEY` |
+| `--workspace-root` | Directory for outputs | `execution_agent_workspace` |
+| `--prompt-files` | Path to prompt templates | `src/execution_agent/prompt_files` |
+| `--log-level` | Log verbosity (DEBUG/INFO/WARNING/ERROR) | `INFO` |
+| `--run-log-dir` | Custom directory for run logs | Auto-generated |
+| `--max-retries` | Retries after budget exhaustion | `2` |
+
+#### Launcher (`python launcher.py`)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--list`, `-l` | List available projects | - |
+| `--run`, `-r` | Run specified projects | - |
+| `--create-meta` | Create metadata files only | - |
+| `--language`, `-L` | Filter by language (for --list) | - |
+| `--model`, `-m` | Model to use | `gpt-4o-mini` |
+| `--step-limit`, `-s` | Step limit per attempt | `40` |
+| `--max-retries`, `-R` | Maximum retries | `2` |
+| `--workspace-root`, `-w` | Workspace directory | `./execution_agent_workspace` |
+| `--parallel`, `-p` | Number of parallel projects | `1` |
+| `--dry-run`, `-n` | Show what would run | - |
+| `--verbose`, `-v` | Show agent output in terminal | - |
+
+### Project Metadata Format
+
+Create a JSON file with project information:
+
+```json
+{
+  "project_path": "my_project",
+  "project_name": "My Project",
+  "project_url": "https://github.com/username/my_project",
+  "language": "Python",
+  "image_tag": "my_project_image:latest",
+  "budget": 40
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `project_path` | Directory name for the project |
+| `project_name` | Human-readable name |
+| `project_url` | Git repository URL |
+| `language` | Primary language (Python, Java, Javascript, C, C++) |
+| `image_tag` | Optional Docker image tag |
+| `budget` | Maximum execution cycles (steps) |
+
+### Available Tools
+
+The agent has access to these tools:
+
+| Tool | Description |
+|------|-------------|
+| `linux_terminal` | Execute bash commands (inside container after Dockerfile is written) |
+| `read_file` | Read file contents |
+| `write_to_file` | Write files (including Dockerfiles) |
+| `search_docker_image` | Search for Docker images |
+| `goals_accomplished` | Signal task completion |
+
+### Language-Specific Guidelines
+
+The agent loads language-specific guidelines from `src/execution_agent/prompt_files/`:
+
+- `python_guidelines` - Python/pip/pytest conventions
+- `java_guidelines` - Java/Maven/Gradle conventions
+- `javascript_guidelines` - JavaScript/npm/TypeScript conventions
+- `c_guidelines` - C build systems (make, cmake)
+- `cpp_guidelines` - C++ build systems
+- `rust_guidelines` - Rust/Cargo conventions
+
+### Retry Mechanism
+
+The agent supports automatic retries when the budget is exhausted:
+
+1. **Attempt 1**: Initial run with full budget
+2. **Attempt 2-N**: Retries with lessons learned from previous attempts
+3. **Forced Exit Cycle**: If all retries fail, a knowledge model generates a final Dockerfile and test script
+
+Each attempt summary includes:
+- Problems encountered
+- Actions taken
+- Progress made
+- Lessons learned
+- Suggestions for next attempt
+- Dockerfile recommendations
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `OPENAI_API_KEY` | API key for LLM access (required) |
+| `OPENAI_MODEL` | Default model (fallback for --model) |
+| `KNOWLEDGE_MODEL` | Default knowledge model |
+
+### Debugging Tips
+
+1. **Check logs**: Start with `run.log` for a high-level overview
+2. **Review prompts**: Look in `cycles_chats/` to see exactly what was sent to the LLM
+3. **Examine conversation**: `messages.json` contains the full conversation history
+4. **Replay commands**: Use `replay_trace.sh` to re-run commands manually
+5. **Tool metrics**: Check `tool_metrics.json` for success rates and timing
+
+### Monitoring Long Runs
+
+For long-running jobs, you can monitor progress:
+
+```bash
+# Watch the log file
+tail -f execution_agent_workspace/_run_logs/<project>/<timestamp>/run.log
+
+# Check current cycle
+grep "CYCLE.*START" execution_agent_workspace/_run_logs/<project>/<timestamp>/run.log | tail -1
+```
+
+### Wrapper Scripts
+
+Create a bash wrapper script to simplify running the agent with your preferred configuration:
+
+#### Basic Wrapper (`run_agent.sh`)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Configuration
+export OPENAI_API_KEY="${OPENAI_API_KEY:-your-api-key-here}"
+MODEL="${MODEL:-gpt-4o-mini}"
+KNOWLEDGE_MODEL="${KNOWLEDGE_MODEL:-gpt-4o}"
+WORKSPACE="./execution_agent_workspace"
+MAX_RETRIES=2
+
+# Check for metadata file argument
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <metadata-file.json> [additional-args...]"
+    exit 1
+fi
+
+METADATA_FILE="$1"
+shift  # Remove first argument, pass rest to the agent
+
+python -m execution_agent.main \
+    --experiment-file "$METADATA_FILE" \
+    --model "$MODEL" \
+    --knowledge-model "$KNOWLEDGE_MODEL" \
+    --workspace-root "$WORKSPACE" \
+    --max-retries "$MAX_RETRIES" \
+    "$@"
+```
+
+#### Multi-Model Wrapper (`run_with_model.sh`)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+export OPENAI_API_KEY="${OPENAI_API_KEY:-your-api-key-here}"
+
+# Model presets
+case "${1:-}" in
+    "fast")
+        MODEL="gpt-4o-mini"
+        KNOWLEDGE_MODEL="gpt-4o-mini"
+        ;;
+    "balanced")
+        MODEL="gpt-4o-mini"
+        KNOWLEDGE_MODEL="gpt-4o"
+        ;;
+    "quality")
+        MODEL="gpt-4o"
+        KNOWLEDGE_MODEL="gpt-4o"
+        ;;
+    "claude")
+        MODEL="claude-sonnet-4-20250514"
+        KNOWLEDGE_MODEL="claude-sonnet-4-20250514"
+        ;;
+    *)
+        echo "Usage: $0 <fast|balanced|quality|claude> <metadata-file.json>"
+        exit 1
+        ;;
+esac
+
+METADATA_FILE="${2:-}"
+if [ -z "$METADATA_FILE" ]; then
+    echo "Usage: $0 <fast|balanced|quality|claude> <metadata-file.json>"
+    exit 1
+fi
+
+echo "Running with MODEL=$MODEL, KNOWLEDGE_MODEL=$KNOWLEDGE_MODEL"
+
+python -m execution_agent.main \
+    --experiment-file "$METADATA_FILE" \
+    --model "$MODEL" \
+    --knowledge-model "$KNOWLEDGE_MODEL" \
+    --workspace-root "./execution_agent_workspace" \
+    --max-retries 2
+```
+
+#### Batch Runner with Pre-created Metadata (`run_batch.sh`)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+export OPENAI_API_KEY="${OPENAI_API_KEY:-your-api-key-here}"
+
+# Directory containing pre-created metadata files
+METADATA_DIR="./metadata_files"
+WORKSPACE="./execution_agent_workspace"
+MODEL="gpt-4o-mini"
+LOG_FILE="batch_run_$(date +%Y%m%d_%H%M%S).log"
+
+echo "Starting batch run at $(date)" | tee "$LOG_FILE"
+
+# Run each metadata file
+for meta_file in "$METADATA_DIR"/*.json; do
+    if [ -f "$meta_file" ]; then
+        project_name=$(basename "$meta_file" .json)
+        echo ""
+        echo "========================================" | tee -a "$LOG_FILE"
+        echo "Running: $project_name" | tee -a "$LOG_FILE"
+        echo "========================================" | tee -a "$LOG_FILE"
+
+        python -m execution_agent.main \
+            --experiment-file "$meta_file" \
+            --model "$MODEL" \
+            --workspace-root "$WORKSPACE" \
+            --max-retries 2 \
+            2>&1 | tee -a "$LOG_FILE"
+
+        exit_code=${PIPESTATUS[0]}
+        if [ $exit_code -eq 0 ]; then
+            echo "SUCCESS: $project_name" | tee -a "$LOG_FILE"
+        else
+            echo "FAILED: $project_name (exit code: $exit_code)" | tee -a "$LOG_FILE"
+        fi
+    fi
+done
+
+echo ""
+echo "Batch run completed at $(date)" | tee -a "$LOG_FILE"
+```
+
+#### Usage Examples
+
+```bash
+# Make scripts executable
+chmod +x run_agent.sh run_with_model.sh run_batch.sh
+
+# Run with basic wrapper
+./run_agent.sh project_meta_data.json
+
+# Run with model preset
+./run_with_model.sh fast project_meta_data.json
+./run_with_model.sh quality project_meta_data.json
+
+# Override environment variables
+MODEL=gpt-4o ./run_agent.sh project_meta_data.json
+
+# Run batch of pre-created metadata files
+./run_batch.sh
+```

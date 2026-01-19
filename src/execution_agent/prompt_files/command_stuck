@@ -1,0 +1,7 @@
+[INSTRUCTIONS: 
+You can interact with the terminal again either by calling terminal with special command TERMINATE as input to terminate the stuck command. Or you can give WAIT as input to wait more. Or you can type in something to the terminal in case the stuck command is waiting for some extra input. You can do this by passing WRITE:HERE_YOU_GIVE_THE_INPUT_TO_THE_STUCK_COMMAND
+Examples:
+{"command": {"name": "linux_terminal", "args": {"command": "TERMINATE"}}}
+{"command": {"name": "linux_terminal", "args": {"command": "WAIT"}}}
+{"command": {"name": "linux_terminal", "args": {"command": "WRITE:yes"}}}
+]

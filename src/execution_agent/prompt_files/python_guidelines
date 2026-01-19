@@ -1,0 +1,48 @@
+## General Guidelines:
+**General Guidelines for Python Projects**
+
+1. **Read the README**  
+   Always start by reading the project's README file on GitHub. It usually contains important instructions for installation, usage, and any project-specific details. Some projects include a `Dockerfile` script, which you can review and reuse as needed.  
+
+2. **Check Dependencies**  
+   Look for dependencies listed in the README or in a `requirements.txt` file. Ensure you have the required versions of Python and any other libraries/packages.  
+
+3. **Virtual Environment**  
+   It’s a good practice to create a virtual environment for each Python project to avoid conflicts with system-wide packages. Use the command:  
+   ```bash
+   python3.X -m venv .venv  
+   ```  
+
+4. **Configuration**  
+   Check if the project requires any configuration files (e.g., `.env` files) and set them up accordingly.  
+
+5. **Build the Project (rare cases)**  
+   Some projects might require building before usage, especially if they include C extensions or require compiling assets.  
+
+6. **Run Tests (if available)**  
+   If the project provides tests, it’s a good idea to run them to ensure everything is working correctly. Some projects include a `tox.ini` file, which allows you to run tests with `tox`. Install `tox` first using:  
+   ```bash
+   pip install tox  
+   ```  
+
+7. **Run the Project**  
+   Follow the instructions in the README to run the project. This could involve running a script, starting a server, or executing a specific command.  
+
+8. **Troubleshooting**  
+   If you encounter issues during installation or while running the project, refer to the project’s issue tracker on GitHub or search for similar issues others may have encountered.  
+
+9. **Test Suite Results**  
+   When running a test suite, it is normal for some test cases to fail. If the percentage of failing test cases is less than 20% of the total number, it is considered acceptable, and further investigation is not necessary.  
+
+10. **Shell Compatibility**  
+   In some shells, the `source` command may not work. In such cases, replace `source` with just `.` (a single dot). For example:  
+   ```bash
+   . .venv/bin/activate  
+   ```  
+
+11. **Avoid Using Conda**  
+   Instead of Conda, prefer the following commands to set up your virtual environment:  
+   ```bash
+   python -m venv .venv  
+   source .venv/bin/activate  
+   ```  
