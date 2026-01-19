@@ -49,6 +49,13 @@ python -m execution_agent.main \
 
 The launcher (`launcher.py`) simplifies running the agent on multiple pre-configured projects:
 
+> [!WARNING]
+> **Always run the launcher with `--verbose`.**  
+> If you start it without `--verbose`, it may **hang / appear stuck**, possibly due to blocking while reading from a PIPE.
+>
+> If it still hangs, re-run with `--verbose` and capture the full output for debugging.
+
+
 ```bash
 # List all available projects
 python launcher.py --list
