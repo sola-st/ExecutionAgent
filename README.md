@@ -8,8 +8,6 @@ The **Execution Agent** is an automated system that sets up, builds, and runs te
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/anthropics/execution-agent.git
-cd execution-agent
 
 # 2. Create and activate virtual environment
 python -m venv venv
