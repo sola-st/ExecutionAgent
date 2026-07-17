@@ -2,6 +2,8 @@
 
 The **Execution Agent** is an automated system that sets up, builds, and runs test suites for software projects inside Docker containers. It analyzes project requirements, creates appropriate Dockerfiles, and executes build/test commands.
 
+See ISSTA'25 paper: [You Name It, I Run It: An LLM Agent to Execute Tests of Arbitrary Projects](https://software-lab.org/publications/issta2025_ExecutionAgent.pdf)
+
 ## Quick Start Guide
 
 ### Setup
