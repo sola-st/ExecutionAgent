@@ -1,0 +1,7 @@
+execution_agent_workspace/
+search_logs/
+search_logs_unified/
+__pycache__/
+
+# macOS
+.DS_Store
