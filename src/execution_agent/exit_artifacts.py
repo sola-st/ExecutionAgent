@@ -27,21 +27,25 @@ def _escape_bash_string(s: str) -> str:
 
 def _extract_dockerfile_content(agent: Any) -> Optional[str]:
     """
-    Extract the Dockerfile content from the agent's written_files.
+    Extract the Dockerfile content from the agent.
+
+    Prefers agent.base_dockerfile, which is only set once a Dockerfile has
+    successfully built an image and started a container. Falls back to the most
+    recently written Dockerfile, since earlier ones may have failed to build.
 
     Returns:
         The Dockerfile content if found, None otherwise.
     """
+    # Prefer the Dockerfile that actually built and started a container
+    if getattr(agent, "base_dockerfile", None):
+        return agent.base_dockerfile
+
     written_files = getattr(agent, "written_files", [])
 
-    for target_name, location, actual_path, content in written_files:
+    for target_name, location, actual_path, content in reversed(written_files):
         # Check if this is a Dockerfile
         if target_name.lower() == "dockerfile" or target_name.lower().endswith(".dockerfile"):
             return content
-
-    # Also check if stored directly on agent
-    if hasattr(agent, "base_dockerfile") and agent.base_dockerfile:
-        return agent.base_dockerfile
 
     return None
 
