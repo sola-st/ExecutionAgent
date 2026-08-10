@@ -1097,14 +1097,19 @@ def read_file(file_path: str, agent) -> dict[str, Any]:
 from datetime import datetime as _dt
 
 
-def _docker_build_image(dockerfile_dir: str, tag: str) -> tuple[bool, str]:
+def _docker_build_image(dockerfile_dir: str, tag: str, repo_url: str = "") -> tuple[bool, str]:
     """
     Build an image and return (ok, full_build_log_text).
 
     Keeps rich legacy logging, including docker daemon error messages, so failures
     contain actionable feedback.
+
+    If repo_url is given it is passed as the REPO_URL build arg, since generated
+    Dockerfiles commonly declare `ARG REPO_URL` and clone from it. Docker only warns
+    about build args the Dockerfile does not declare, so this is safe either way.
     """
     client = _docker_client()
+    build_args = {"REPO_URL": repo_url} if repo_url else {}
 
     def _ts() -> str:
         return _dt.now().strftime("%H:%M:%S")
@@ -1115,7 +1120,7 @@ def _docker_build_image(dockerfile_dir: str, tag: str) -> tuple[bool, str]:
         for ln in (msg.rstrip("\n").splitlines() or [""]):
             log_lines.append(f"[{_ts()}] {ln}")
 
-    _log(f"Starting build: context='{dockerfile_dir}', tag='{tag}'")
+    _log(f"Starting build: context='{dockerfile_dir}', tag='{tag}', build_args={build_args}")
 
     try:
         # Build the image - Docker SDK returns (image, logs_generator) tuple
@@ -1125,7 +1130,8 @@ def _docker_build_image(dockerfile_dir: str, tag: str) -> tuple[bool, str]:
             tag=tag,
             rm=True,
             pull=True,
-            nocache=False
+            nocache=False,
+            buildargs=build_args,
         )
 
         for chunk in logs:
@@ -1350,7 +1356,9 @@ def write_to_file(
                 # Store the docker tag for trace generation
                 agent.docker_tag = tag
 
-                ok, build_log = _docker_build_image(str(dockerfile_dir), tag)
+                ok, build_log = _docker_build_image(
+                    str(dockerfile_dir), tag, repo_url=str(getattr(agent, "project_url", "") or "")
+                )
                 if not ok:
                     # Return the FULL build log to the LLM for complete context
                     # The LLM can analyze the entire log to understand what went wrong
