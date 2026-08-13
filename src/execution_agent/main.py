@@ -805,6 +805,7 @@ def main() -> int:
     project_path = meta["project_path"]
     project_url = meta["project_url"]
     language = meta.get("language", "unknown")
+    commit = str(meta.get("commit", "") or "")
 
     # Run directory for logs/transcripts
     if args.run_log_dir:
@@ -839,6 +840,8 @@ def main() -> int:
 
     LOG.info("Project: %s", project_path)
     LOG.info("Repo:    %s", project_url)
+    if commit:
+        LOG.info("Commit:  %s", commit)
     LOG.info("Model:   %s", args.model)
     LOG.info("Knowledge Model: %s", args.knowledge_model)
     LOG.info("Run dir: %s", str(run_dir))
@@ -897,6 +900,7 @@ def main() -> int:
         project_url=project_url,
         language=language,
         search_workflows_summary_prompt=search_workflows_summary,
+        commit=commit,
     )
     LOG.info("Repository context built successfully")
 
@@ -945,6 +949,7 @@ def main() -> int:
     agent.workspace_path = args.workspace_root
     agent.project_path = project_path
     agent.project_url = project_url
+    agent.commit = commit
     agent.hyperparams = meta
     agent.repo_context = repo_context
     agent.tools_doc_string = tools_doc_string

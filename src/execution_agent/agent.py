@@ -320,6 +320,23 @@ class ExecutionAgent:
             parts.append(f"Project path: {ctx.project_path}")
             parts.append(f"Project URL: {ctx.project_url}")
             parts.append(f"Primary language: {ctx.language}")
+
+            pinned = getattr(ctx, "commit", None) or getattr(self, "commit", "")
+            if pinned:
+                parts.append("")
+                parts.append(f"REQUIRED COMMIT: {pinned}")
+                parts.append(
+                    "This task targets that exact commit, not the default branch. Your Dockerfile "
+                    "must clone with full history and check it out, e.g.:\n"
+                    "```dockerfile\n"
+                    "ARG REPO_URL\n"
+                    f"ARG COMMIT_SHA={pinned}\n"
+                    'RUN git clone "$REPO_URL" repo && cd repo && git checkout --detach "$COMMIT_SHA"\n'
+                    "```\n"
+                    "Do NOT use `git clone --depth 1` alone - a shallow clone of the default branch "
+                    "will not contain this commit. Verify with `git rev-parse HEAD` before running "
+                    "the tests, and build/test the code at this commit."
+                )
             parts.append("")
 
             # Add language-specific guidelines if available

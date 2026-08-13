@@ -352,6 +352,7 @@ class RepoContext:
     unified_summary: Optional[str] = None
     problems_memory: Optional[str] = None
     local_repo_available: bool = False                # True if repo was cloned locally during preprocessing
+    commit: Optional[str] = None                      # pinned commit SHA, if any
 
     def __post_init__(self):
         if self.requirement_files is None:
@@ -869,34 +870,54 @@ class ContextBuilder:
         return txt if txt.strip() else None
 
     # ---------- repository cloning ----------
-    def clone_repo(self, project_path: str, project_url: str) -> bool:
+    def clone_repo(self, project_path: str, project_url: str, commit: str = "") -> bool:
         """
         Clone the repository into workspace_root/project_path if not already present.
-        Returns True if the repo is available (either already existed or was cloned successfully).
+
+        When `commit` is set the clone is made at full depth and checked out at that
+        SHA, so one repository can appear under several project_path directories
+        pinned to different commits. Without a commit the clone stays shallow.
+
+        Returns True if the repo is available and, when requested, sits at `commit`.
         """
         target_dir = os.path.join(self.workspace_root, project_path)
+
+        def _checkout(where: str) -> bool:
+            if not commit:
+                return True
+            res = subprocess.run(
+                ["git", "-C", where, "checkout", "--detach", commit],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
+            )
+            if res.returncode == 0:
+                _LOG.info(f"Checked out {commit} in {where}")
+                return True
+            _LOG.warning(f"Failed to check out {commit} in {where}: {res.stderr.strip()}")
+            return False
 
         # Check if already cloned (has .git directory)
         if os.path.isdir(os.path.join(target_dir, ".git")):
             _LOG.info(f"Repository already exists at {target_dir}")
-            return True
+            return _checkout(target_dir)
 
         # Create parent directory if needed
         os.makedirs(self.workspace_root, exist_ok=True)
 
         # Clone the repository
-        _LOG.info(f"Cloning repository {project_url} to {target_dir}...")
+        cmd = ["git", "clone"] + ([] if commit else ["--depth", "1"]) + [project_url, target_dir]
+        _LOG.info(f"Cloning repository {project_url} to {target_dir}"
+                  + (f" (full depth, will check out {commit})" if commit else " (shallow)") + "...")
         try:
             result = subprocess.run(
-                ["git", "clone", "--depth", "1", project_url, target_dir],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=300,  # 5 minute timeout for large repos
+                timeout=900 if commit else 300,  # full clones of large repos are slow
             )
             if result.returncode == 0:
                 _LOG.info(f"Successfully cloned {project_url} to {target_dir}")
-                return True
+                return _checkout(target_dir)
             else:
                 _LOG.warning(f"Failed to clone {project_url}: {result.stderr}")
                 return False
@@ -1469,6 +1490,7 @@ Provide a concise, actionable summary focused on our goal of installing from sou
         project_url: str,
         language: str,
         search_workflows_summary_prompt: str,
+        commit: str = "",
         unified_summary_cache_root: str = "search_logs_unified",
         perform_web_search_if_missing: bool = True,
     ) -> RepoContext:
@@ -1490,7 +1512,7 @@ Provide a concise, actionable summary focused on our goal of installing from sou
             perform_web_search_if_missing: Whether to perform web search if no cached results
         """
         # Clone the repository first so the agent can explore it before creating a container
-        local_repo_available = self.clone_repo(project_path, project_url)
+        local_repo_available = self.clone_repo(project_path, project_url, commit=commit)
 
         # Find and load workflow files (CI/CD)
         workflows = self.find_workflows(project_path, filter_by_keywords=False)
@@ -1566,4 +1588,5 @@ Provide a concise, actionable summary focused on our goal of installing from sou
             unified_summary=unified_summary,
             problems_memory=problems_memory,
             local_repo_available=local_repo_available,
+            commit=commit or None,
         )

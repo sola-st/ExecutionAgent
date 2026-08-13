@@ -42,6 +42,7 @@ class Project:
     url: str
     language: str
     image_tag: str
+    commit: str = ""          # commit SHA to check out; empty means default branch HEAD
 
     @property
     def safe_name(self) -> str:
@@ -139,6 +140,7 @@ def create_metadata_file(project: Project, output_dir: Path, budget: int = 40) -
         "project_url": project.url,
         "language": project.language,
         "image_tag": project.image_tag,
+        "commit": project.commit,           # checked out by the agent; empty = HEAD
         "budget": budget,                   # Step limit per attempt
         "created_at": datetime.now().isoformat(),
     }
