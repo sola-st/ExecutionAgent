@@ -18,9 +18,10 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -46,8 +47,12 @@ class Project:
 
     @property
     def safe_name(self) -> str:
-        """Return a filesystem-safe name."""
-        return self.name.lower().replace("-", "_").replace(".", "_")
+        """
+        Return a filesystem-safe name; used as the workspace directory and project_path.
+        Built-in names only contain letters, digits, '-' and '.', which map exactly as
+        before; anything else (e.g. '@' or '/' in "commons-csv@a1b2c3d") becomes '_'.
+        """
+        return re.sub(r"[^a-z0-9_]", "_", self.name.lower())
 
 
 # All 50 projects
@@ -123,6 +128,98 @@ for p in PROJECTS:
     PROJECTS_BY_LANGUAGE[lang].append(p)
 
 
+def _rebuild_lookups() -> None:
+    """Rebuild the name/language lookup tables from PROJECTS."""
+    PROJECTS_BY_NAME.clear()
+    PROJECTS_BY_LANGUAGE.clear()
+    for p in PROJECTS:
+        PROJECTS_BY_NAME[p.name.lower()] = p
+        PROJECTS_BY_LANGUAGE.setdefault(p.language.lower(), []).append(p)
+
+
+def register_projects(projects: List[Project]) -> None:
+    """
+    Add projects to the registry. An entry whose name matches a built-in project
+    (case-insensitive) replaces it, which is how a built-in gets pinned to a commit.
+    Names must map to distinct safe_names: safe_name is the workspace directory and
+    project_path, so two entries sharing one would overwrite each other's outputs.
+    """
+    seen: Dict[str, str] = {p.safe_name: p.name for p in PROJECTS}
+    added: Dict[str, str] = {}
+    for p in projects:
+        if p.name.lower() in added:
+            raise ValueError(
+                f"Project '{p.name}' is listed twice (names are case-insensitive; safe_name "
+                f"'{p.safe_name}'); give the entries distinct names."
+            )
+        added[p.name.lower()] = p.name
+        # Look in the live list, not the lookup table (rebuilt only at the end), so two
+        # file entries naming the same built-in are reported, not crashed on.
+        existing = next((q for q in PROJECTS if q.name.lower() == p.name.lower()), None)
+        if existing is not None:
+            PROJECTS.remove(existing)
+            seen.pop(existing.safe_name, None)
+        if p.safe_name in seen:
+            raise ValueError(
+                f"Project '{p.name}' and '{seen[p.safe_name]}' both map to safe_name "
+                f"'{p.safe_name}'; give them distinct names."
+            )
+        seen[p.safe_name] = p.name
+        PROJECTS.append(p)
+    _rebuild_lookups()
+
+
+def load_projects_file(path: Path) -> List[Project]:
+    """
+    Load projects from a JSON file: a list of objects (or {"projects": [...]}) with
+    required "name", "url", "language" and optional "image_tag" and "commit".
+    image_tag defaults to "<safe_name>_image:ExecutionAgent".
+
+    This is how a (repository, commit) benchmark is expressed: several entries may
+    share a url as long as their names differ, e.g. "commons-csv@a1b2c3d".
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        data = data.get("projects")
+    if not isinstance(data, list):
+        raise ValueError(f"{path}: expected a JSON list of project objects")
+
+    projects: List[Project] = []
+    for i, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path}: entry {i} is not an object")
+        missing = [k for k in ("name", "url", "language") if not entry.get(k)]
+        if missing:
+            raise ValueError(f"{path}: entry {i} is missing required field(s): {', '.join(missing)}")
+        p = Project(
+            name=str(entry["name"]),
+            url=str(entry["url"]),
+            language=str(entry["language"]),
+            image_tag=str(entry.get("image_tag") or ""),
+            commit=str(entry.get("commit") or "").strip(),
+        )
+        if not p.image_tag:
+            p.image_tag = f"{p.safe_name}_image:ExecutionAgent"
+        projects.append(p)
+    return projects
+
+
+def apply_commit_override(projects: List[Project], commit: Optional[str]) -> Optional[List[Project]]:
+    """
+    Pin the selected project to `commit`. Only meaningful for a single project: one
+    SHA cannot apply to several repositories. Returns None (after printing why) if
+    the override is ambiguous.
+    """
+    if not commit:
+        return projects
+    if len(projects) != 1:
+        print(f"--commit applies to exactly one project, but the selection matched {len(projects)}.")
+        print("Use a --projects-file to pin several projects to their own commits.")
+        return None
+    return [replace(projects[0], commit=commit.strip())]
+
+
 # =============================================================================
 # Utility Functions
 # =============================================================================
@@ -159,11 +256,12 @@ def print_header(text: str, char: str = "=", width: int = 80) -> None:
 
 def print_project_table(projects: List[Project]) -> None:
     """Print a formatted table of projects."""
-    print(f"{'#':<4} {'Name':<25} {'Language':<12} {'URL':<50}")
-    print("-" * 95)
+    print(f"{'#':<4} {'Name':<25} {'Language':<12} {'URL':<50} {'Commit':<12}")
+    print("-" * 108)
     for i, p in enumerate(projects, 1):
         url_short = p.url[:47] + "..." if len(p.url) > 50 else p.url
-        print(f"{i:<4} {p.name:<25} {p.language:<12} {url_short:<50}")
+        commit_short = p.commit[:12] if p.commit else "HEAD"
+        print(f"{i:<4} {p.name:<25} {p.language:<12} {url_short:<50} {commit_short:<12}")
 
 
 def resolve_project_selection(selection: str) -> List[Project]:
@@ -513,6 +611,24 @@ Examples:
         default=None,
         help="Knowledge model for web search/summaries (passed through to the agent)",
     )
+
+    # Project source / pinning
+    parser.add_argument(
+        "--projects-file", "-P",
+        type=Path,
+        default=None,
+        help=(
+            "JSON file with extra projects: a list of {name, url, language, image_tag?, commit?}. "
+            "Entries named like a built-in project replace it. Lets one repository appear "
+            "several times under different names, each pinned to its own commit."
+        ),
+    )
+    parser.add_argument(
+        "--commit",
+        type=str,
+        default=None,
+        help="Pin the (single) selected project to this commit SHA instead of the default branch HEAD",
+    )
     parser.add_argument(
         "--step-limit", "-s",
         type=int,
@@ -561,6 +677,15 @@ def main() -> int:
     workspace_root = Path(args.workspace_root) if args.workspace_root else script_dir / "execution_agent_workspace"
     workspace_root.mkdir(parents=True, exist_ok=True)
 
+    if args.projects_file:
+        try:
+            extra = load_projects_file(args.projects_file)
+            register_projects(extra)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            print(f"Could not load --projects-file: {e}")
+            return 1
+        print(f"Loaded {len(extra)} project(s) from {args.projects_file}")
+
     # Handle --list
     if args.list:
         print_header("Available Projects")
@@ -593,6 +718,9 @@ def main() -> int:
         if not projects:
             print(f"No projects found matching: {args.create_meta}")
             return 1
+        projects = apply_commit_override(projects, args.commit)
+        if projects is None:
+            return 1
 
         print_header(f"Creating metadata for {len(projects)} project(s)")
 
@@ -614,9 +742,13 @@ def main() -> int:
             print("\nUse --list to see available projects")
             return 1
 
+        projects = apply_commit_override(projects, args.commit)
+        if projects is None:
+            return 1
+
         print(f"Selected {len(projects)} project(s):")
         for p in projects:
-            print(f"  - {p.name} ({p.language})")
+            print(f"  - {p.name} ({p.language})" + (f" @ {p.commit}" if p.commit else ""))
 
         runner = AgentRunner(
             workspace_root=workspace_root,
