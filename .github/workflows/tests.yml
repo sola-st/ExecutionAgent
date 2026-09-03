@@ -1,0 +1,50 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  execution-agent:
+    name: execution_agent tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+
+      # The test file sets its own git identity; this keeps `git clone`/`push`
+      # against the file:// remotes quiet on a fresh runner.
+      - name: Configure git
+        run: |
+          git config --global init.defaultBranch main
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+
+      # --confcutdir keeps pytest from loading tests/conftest.py, which belongs to
+      # the inherited mini-swe-agent suite and imports packages not installed here.
+      # Docker is available on ubuntu-latest, so the container-backed tests run
+      # (they pull busybox and ubuntu:24.04); anywhere without a daemon they skip.
+      - name: Test
+        run: |
+          python -m pytest tests/execution_agent \
+            --confcutdir=tests/execution_agent \
+            -p no:cacheprovider -W ignore -v -ra --durations=10
