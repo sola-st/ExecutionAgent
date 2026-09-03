@@ -166,19 +166,32 @@ class TestUnifiedSummaryIsCommitAware:
         q = self._run("0123abcd")
         assert "--depth 1" not in q.split("IMPORTANT - PINNED COMMIT")[0]   # template part is clean
 
-    def test_failed_pinned_checkout_does_not_scan_or_cache(self, tmp_path, remote):
-        """Review finding: a transient checkout failure summarised the wrong tree and
-        cached it under the commit key, poisoning every later run for that commit."""
+    def test_unreachable_pinned_commit_aborts_before_any_llm_call(self, tmp_path, remote):
+        """A run without its repository used to continue with a warning, summarise the
+        wrong tree and cache it under the commit key. It now stops with the reason."""
+        from execution_agent.context import RepositoryUnavailable
         ws = tmp_path / "ws"; cache = tmp_path / "cache"
         cb = ContextBuilder(workspace_root=str(ws), search_logs_root=str(tmp_path / "sl"),
                             problems_memory_root=str(tmp_path / "pm"))
         model = self._CaptureModel()
-        ctx = cb.build_repo_context(model=model, project_path="proj", project_url=remote["url"], language="Python",
-                                    search_workflows_summary_prompt="S {}", commit="0" * 40,
-                                    unified_summary_cache_root=str(cache), perform_web_search_if_missing=False)
-        assert ctx.local_repo_available is False
-        assert ctx.unified_summary is None and model.queries == []
-        assert not cache.exists() or not list(cache.rglob("unified_summary*"))
+        with pytest.raises(RepositoryUnavailable) as ei:
+            cb.build_repo_context(model=model, project_path="proj", project_url=remote["url"], language="Python",
+                                  search_workflows_summary_prompt="S {}", commit="0" * 40,
+                                  unified_summary_cache_root=str(cache), perform_web_search_if_missing=False)
+        msg = str(ei.value)
+        assert "0" * 40 in msg and "git said:" in msg and "Hint:" in msg and "does not exist" in msg
+        assert model.queries == [] and not cache.exists()
+
+    def test_clone_failure_aborts_with_gits_message_and_a_hint(self, tmp_path):
+        from execution_agent.context import RepositoryUnavailable
+        cb = ContextBuilder(workspace_root=str(tmp_path / "ws"), search_logs_root=str(tmp_path / "sl"),
+                            problems_memory_root=str(tmp_path / "pm"))
+        with pytest.raises(RepositoryUnavailable) as ei:
+            cb.build_repo_context(model=self._CaptureModel(), project_path="proj",
+                                  project_url=str(tmp_path / "does-not-exist.git"), language="Python",
+                                  search_workflows_summary_prompt="S {}", perform_web_search_if_missing=False)
+        assert "does not exist" in str(ei.value) or "not found" in str(ei.value).lower()
+        assert "Hint: The repository URL looks wrong" in str(ei.value)
 
     def test_cache_path_is_keyed_by_commit(self):
         """A pinned summary embeds the SHA, so it must not be served to an unpinned
@@ -304,6 +317,42 @@ class TestCloneRepoCommitRecovery:
         assert cb.clone_repo("proj", remote["url"], commit=new_sha) is True
         assert self._head(ws / "proj") == new_sha
         assert not (ws / "proj/.git/shallow").exists()
+
+    def test_transient_clone_failure_is_retried_once(self, tmp_path, remote, monkeypatch):
+        """GitHub's anonymous-git throttle answers 401 request by request; one retry
+        after a wait turns a blip into a normal run."""
+        import subprocess as sp
+        from execution_agent import context as ctx_mod
+        monkeypatch.setenv("EXECUTION_AGENT_CLONE_RETRY_WAIT", "0")
+        real_run = sp.run; calls = {"clone": 0}
+        def flaky(cmd, *a, **kw):
+            if "clone" in cmd:
+                calls["clone"] += 1
+                if calls["clone"] == 1:
+                    return sp.CompletedProcess(cmd, 128, "", "fatal: could not read Username for 'https://github.com': No such device or address\nfatal: expected flush after ref listing")
+            return real_run(cmd, *a, **kw)
+        monkeypatch.setattr(ctx_mod.subprocess, "run", flaky)
+        cb = ContextBuilder(workspace_root=str(tmp_path / "ws"))
+        assert cb.clone_repo("proj", remote["url"]) is True
+        assert calls["clone"] == 2 and self._head(tmp_path / "ws" / "proj") == remote["main"]
+
+    def test_fatal_clone_failure_is_not_retried(self, tmp_path, monkeypatch):
+        import subprocess as sp
+        from execution_agent import context as ctx_mod
+        monkeypatch.setenv("EXECUTION_AGENT_CLONE_RETRY_WAIT", "0")
+        calls = {"clone": 0}
+        def fatal(cmd, *a, **kw):
+            calls["clone"] += 1
+            return sp.CompletedProcess(cmd, 128, "", "fatal: repository 'https://github.com/x/y/' not found")
+        monkeypatch.setattr(ctx_mod.subprocess, "run", fatal)
+        cb = ContextBuilder(workspace_root=str(tmp_path / "ws"))
+        assert cb.clone_repo("proj", "https://github.com/x/y") is False
+        assert calls["clone"] == 1 and "not found" in cb.last_clone_error
+        from execution_agent.context import clone_error_hint, clone_error_is_transient
+        assert "URL looks wrong" in clone_error_hint(cb.last_clone_error, "https://github.com/x/y")
+        assert not clone_error_is_transient(cb.last_clone_error)
+        assert clone_error_is_transient("fatal: could not read Username for 'https://github.com'")
+        assert "HTTP 401" in clone_error_hint("fatal: expected flush after ref listing")
 
     def test_fetch_timeout_returns_false_instead_of_raising(self, tmp_path, remote, monkeypatch):
         """Review finding: a hung fetch raised TimeoutExpired out of clone_repo."""

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -12,6 +13,60 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 from execution_agent.shared_utils import pinned_clone_snippet, render_pinned_template
+
+
+class RepositoryUnavailable(RuntimeError):
+    """The project repository could not be cloned / checked out locally. Raised before
+    any LLM call: a run without its repository would burn budget on a container that
+    most likely cannot clone either, and would hide the failure in a warning."""
+
+
+_TRANSIENT_CLONE_MARKERS = (
+    "could not read username",          # GitHub answering anonymous git with 401 (throttling)
+    "expected flush after ref listing",
+    "connection reset",
+    "connection timed out",
+    "early eof",
+    "rpc failed",
+    "the remote end hung up",
+    "could not resolve host",
+    "timed out",
+    "429",
+    "503",
+)
+_FATAL_CLONE_MARKERS = (
+    "not found",
+    "does not exist",
+    "does not appear to be a git repository",
+    "invalid username or password",
+    "authentication failed",
+    "permission denied",
+)
+
+
+def clone_error_is_transient(stderr: str) -> bool:
+    s = (stderr or "").lower()
+    if any(m in s for m in _FATAL_CLONE_MARKERS) and "could not read username" not in s:
+        return False
+    return any(m in s for m in _TRANSIENT_CLONE_MARKERS)
+
+
+def clone_error_hint(stderr: str, project_url: str = "") -> str:
+    """A one-line explanation of the common git failure modes, for the run log."""
+    s = (stderr or "").lower()
+    if "could not read username" in s or "expected flush after ref listing" in s:
+        return ("GitHub answered anonymous git with HTTP 401. That means either the repository does not "
+                "exist or is private (check the URL), or GitHub is throttling anonymous clones from this "
+                "machine, which it does after many clones in a short time (wait a while and rerun).")
+    if "not found" in s or "does not exist" in s or "does not appear to be a git repository" in s:
+        return f"The repository URL looks wrong or the repository is private: {project_url}"
+    if "could not resolve host" in s:
+        return "DNS failure: this machine cannot resolve the git host right now."
+    if "timed out" in s:
+        return "The clone timed out; the repository may be very large or the network slow."
+    if "not a tree" in s or "reference is not a tree" in s or "not reachable" in s:
+        return "The pinned commit does not exist on the remote (check the SHA) or is not reachable from any branch or tag."
+    return "See git's message above."
 
 try:
     import yaml
@@ -373,6 +428,7 @@ class ContextBuilder:
         self.workspace_root = workspace_root
         self.search_logs_root = search_logs_root
         self.problems_memory_root = problems_memory_root
+        self.last_clone_error: str = ""   # git's message for the last clone_repo failure
 
     def _shorten_path(self, full_path: str, project_name: str) -> str:
         """
@@ -952,6 +1008,7 @@ class ContextBuilder:
             if _has_commit(where) and _try_checkout(where):
                 _LOG.info(f"Checked out {commit} in {where} after fetching")
                 return True
+            self.last_clone_error = f"commit {commit} is not reachable from origin ({project_url})"
             _LOG.warning(f"Failed to check out {commit} in {where}: not reachable from origin")
             return False
 
@@ -966,28 +1023,33 @@ class ContextBuilder:
         # Clone the repository
         cmd = ["git", "clone"] + ([] if commit else ["--depth", "1"]) + [project_url, target_dir]
         clone_timeout = 900 if commit else 300  # full clones of large repos are slow
-        _LOG.info(f"Cloning repository {project_url} to {target_dir}"
-                  + (f" (full depth, will check out {commit})" if commit else " (shallow)") + "...")
-        try:
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=clone_timeout,
-            )
-            if result.returncode == 0:
-                _LOG.info(f"Successfully cloned {project_url} to {target_dir}")
-                return _checkout(target_dir)
+        retry_wait = float(os.environ.get("EXECUTION_AGENT_CLONE_RETRY_WAIT", "30"))
+        self.last_clone_error = ""
+        for attempt in (1, 2):
+            _LOG.info(f"Cloning repository {project_url} to {target_dir}"
+                      + (f" (full depth, will check out {commit})" if commit else " (shallow)")
+                      + (f" (attempt {attempt})" if attempt > 1 else "") + "...")
+            try:
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=clone_timeout)
+                if result.returncode == 0:
+                    _LOG.info(f"Successfully cloned {project_url} to {target_dir}")
+                    return _checkout(target_dir)
+                self.last_clone_error = result.stderr.strip()
+            except subprocess.TimeoutExpired:
+                self.last_clone_error = f"git clone timed out after {clone_timeout}s"
+            except Exception as e:
+                self.last_clone_error = f"{type(e).__name__}: {e}"
+            _LOG.warning(f"Failed to clone {project_url}: {self.last_clone_error}")
+            # a partial clone directory would be mistaken for an existing clone next time
+            shutil.rmtree(target_dir, ignore_errors=True)
+            if attempt == 1 and clone_error_is_transient(self.last_clone_error) and retry_wait > 0:
+                _LOG.info(f"Clone failure looks transient; retrying once in {retry_wait:.0f}s")
+                time.sleep(retry_wait)
+            elif attempt == 1 and clone_error_is_transient(self.last_clone_error):
+                continue
             else:
-                _LOG.warning(f"Failed to clone {project_url}: {result.stderr}")
-                return False
-        except subprocess.TimeoutExpired:
-            _LOG.warning(f"Cloning {project_url} timed out after {clone_timeout}s")
-            return False
-        except Exception as e:
-            _LOG.warning(f"Failed to clone {project_url}: {e}")
-            return False
+                break
+        return False
 
     # ---------- web search cache loader ----------
     def load_cached_search_results(self, project_id: str) -> List[Dict[str, Any]]:
@@ -1599,14 +1661,18 @@ Provide a concise, actionable summary focused on our goal of installing from sou
         # Clone the repository first so the agent can explore it before creating a container
         local_repo_available = self.clone_repo(project_path, project_url, commit=commit)
 
-        # A pinned run whose checkout failed must not describe (and cache!) whatever
-        # tree happens to be on disk; the container clones the source itself.
-        pinned_checkout_failed = bool(commit) and not local_repo_available
-        if pinned_checkout_failed:
-            _LOG.warning(f"Pinned commit {commit} could not be checked out locally; skipping local scan and summary cache")
-            workflows, workflow_contents, dockerfiles, dockerfile_contents = [], [], [], []
-            requirement_paths, requirement_files, readme_path, readme_content = [], [], None, None
-        else:
+        if not local_repo_available:
+            # Stop before any LLM call: without the repository the summary is built
+            # from web search alone and the container most likely cannot clone either.
+            err = self.last_clone_error or "unknown error"
+            raise RepositoryUnavailable(
+                f"Could not obtain the repository {project_url}"
+                + (f" at commit {commit}" if commit else "")
+                + f" in {os.path.join(self.workspace_root, project_path)}.\n"
+                f"git said: {err}\n"
+                f"Hint: {clone_error_hint(err, project_url)}"
+            )
+        if True:
             # Find and load workflow files (CI/CD)
             workflows = self.find_workflows(project_path, filter_by_keywords=False)
             workflow_contents = self.load_workflow_contents(
@@ -1652,7 +1718,7 @@ Provide a concise, actionable summary focused on our goal of installing from sou
 
         # Use knowledge_model for unified summary (more up-to-date knowledge)
         # Pass all collected information to create a comprehensive summary
-        cache_path = None if pinned_checkout_failed else self.unified_summary_cache_path(unified_summary_cache_root, project_path, commit)
+        cache_path = self.unified_summary_cache_path(unified_summary_cache_root, project_path, commit)
         unified_summary = self.build_unified_summary(
             model=model,
             knowledge_model=knowledge_model,

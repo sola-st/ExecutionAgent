@@ -70,7 +70,7 @@ from execution_agent.tools import (
     search_docker_image,
     goals_accomplished,
 )
-from execution_agent.context import ContextBuilder
+from execution_agent.context import ContextBuilder, RepositoryUnavailable
 
 
 # -------------------------
@@ -899,15 +899,24 @@ def main() -> int:
 
     LOG.info("Building repository context (cloning repo, finding workflows, requirements, README)...")
     ctx_builder = ContextBuilder(workspace_root=args.workspace_root)
-    repo_context = ctx_builder.build_repo_context(
-        model=model,
-        knowledge_model=knowledge_model,
-        project_path=project_path,
-        project_url=project_url,
-        language=language,
-        search_workflows_summary_prompt=search_workflows_summary,
-        commit=commit,
-    )
+    try:
+        repo_context = ctx_builder.build_repo_context(
+            model=model,
+            knowledge_model=knowledge_model,
+            project_path=project_path,
+            project_url=project_url,
+            language=language,
+            search_workflows_summary_prompt=search_workflows_summary,
+            commit=commit,
+        )
+    except RepositoryUnavailable as e:
+        LOG.error("=" * 70)
+        LOG.error("ABORTING RUN: the project repository could not be cloned.")
+        for line in str(e).splitlines():
+            LOG.error(line)
+        LOG.error("No LLM call was made. Fix the cause and rerun this project.")
+        LOG.error("=" * 70)
+        return 3
     LOG.info("Repository context built successfully")
 
     tools_doc_path = pf / "tools_list"
