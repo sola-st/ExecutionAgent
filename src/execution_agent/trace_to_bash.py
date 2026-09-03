@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import shlex
 from pathlib import Path
+from execution_agent.shared_utils import pinned_commit_of
 from typing import Any, List, Tuple
 
 
@@ -58,12 +59,17 @@ def _generate_file_write(filename: str, content: str, location: str) -> str:
     return "\n".join(lines)
 
 
-def _generate_docker_build(dockerfile_dir: str, tag: str) -> str:
-    """Generate bash command to build Docker image."""
+def _generate_docker_build(dockerfile_dir: str, tag: str, repo_url: str = "", commit: str = "") -> str:
+    """Generate bash command to build Docker image (same build args as the agent's build)."""
     lines = []
     lines.append(f"# Building Docker image: {tag}")
     lines.append(f"echo 'Building Docker image: {tag}'")
-    lines.append(f"docker build -t '{_escape_bash_string(tag)}' '{_escape_bash_string(dockerfile_dir)}'")
+    build_args = ""
+    if repo_url:
+        build_args += f" --build-arg 'REPO_URL={_escape_bash_string(repo_url)}'"
+    if commit:
+        build_args += f" --build-arg 'COMMIT_SHA={_escape_bash_string(commit)}'"
+    lines.append(f"docker build{build_args} -t '{_escape_bash_string(tag)}' '{_escape_bash_string(dockerfile_dir)}'")
     lines.append("BUILD_STATUS=$?")
     lines.append("if [ $BUILD_STATUS -ne 0 ]; then")
     lines.append("  echo 'ERROR: Docker build failed with exit code $BUILD_STATUS'")
@@ -131,6 +137,8 @@ def generate_bash_script_from_trace(
     written_files: List[Tuple[str, str, str, str]],
     dockerfile_tag: str = "",
     project_path: str = "",
+    repo_url: str = "",
+    commit: str = "",
 ) -> str:
     """
     Generate a standalone bash script from agent execution trace.
@@ -210,7 +218,7 @@ def generate_bash_script_from_trace(
         lines.append("# Docker image build and container start")
         lines.append("# ============================================")
         lines.append("")
-        lines.append(_generate_docker_build(dockerfile_dir, dockerfile_tag))
+        lines.append(_generate_docker_build(dockerfile_dir, dockerfile_tag, repo_url=repo_url, commit=commit))
         lines.append(_generate_docker_start(dockerfile_tag))
         container_started = True
 
@@ -270,6 +278,8 @@ def save_bash_script_from_agent(
         written_files=written_files,
         dockerfile_tag=dockerfile_tag,
         project_path=project_path,
+        repo_url=str(getattr(agent, "project_url", "") or ""),
+        commit=pinned_commit_of(agent),
     )
 
     output_path = Path(output_path)
