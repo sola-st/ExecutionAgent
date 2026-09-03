@@ -505,3 +505,133 @@ def log_exception(
                 raise
         return wrapper  # type: ignore
     return decorator
+
+
+# ---------------------------------------------------------------------
+# Screen executor support
+# ---------------------------------------------------------------------
+
+def screen_staging_script(run_id: str, logfile: str, script: str, cmd: str, *, source: bool) -> tuple[str, str]:
+    """
+    Build the ONE shell script that stages a command for the screen executor, and the
+    path of the per-command wrapper it installs. Returns (wrapper_path, staging_text).
+
+    The staging text (run via docker exec, never typed) does, under `set -e` so any
+    failure - a truncated heredoc on a full disk included - surfaces as a non-zero
+    status: write the command script, truncate the logfile, write the wrapper.
+
+    The wrapper is what gets typed into screen, as the bare text `. <wrapper>`:
+      - GNU screen's `stuff` expands `$NAME` in typed text (verified by capturing the
+        keystrokes), so the exit-status capture cannot be typed; it lives in this
+        file, which is only sourced.
+      - All paths are literals and the wrapper is sourced WITHOUT arguments, so the
+        user's command runs with the shell's own (empty) positional parameters, as it
+        did with the original inline payload; a `source activate`-style script that
+        forwards "$@", or a `set --`/`shift` in the command, cannot disturb the
+        markers. It also works in a non-bash shell, which ignores `.` arguments.
+      - The user script is sourced inside `if`, so a `set -e` in it cannot kill the
+        interactive shell (bash ignores errexit for an `if` condition).
+      - The wrapper removes the script and itself when done: no per-command litter.
+    `source=True` keeps `cd`/`export` in the shell; `exec` runs a child bash (probe).
+    """
+    wrapper = f"/tmp/screen_wrap_{run_id}.sh"
+    run = f". {script}" if source else f"/usr/bin/env bash {script}"
+    body = (
+        "#!/bin/bash\n"
+        f'printf "%s\\n" "<<BEGIN:{run_id}>>" >> {logfile}\n'
+        f"if {run} >> {logfile} 2>&1; then __rc=0; else __rc=$?; fi\n"
+        f'printf "%s\\n" "<<END:{run_id}>>" >> {logfile}\n'
+        f'printf "<<RC:{run_id}:%d>>\\n" "$__rc" >> {logfile}\n'
+        "unset __rc\n"
+        f"rm -f {script} {wrapper}\n"
+    )
+    staging = (
+        "set -e\n"
+        f"cat > {script} <<'__SRC_{run_id}__'\n{cmd}\n__SRC_{run_id}__\n"
+        f"chmod +x {script}\n"
+        f": > {logfile}\n"
+        f"cat > {wrapper} <<'__WRAP_{run_id}__'\n{body}__WRAP_{run_id}__\n"
+    )
+    return wrapper, staging
+
+
+def stuff_escape(text: str) -> str:
+    """
+    Escape free text for `screen -S <s> -X stuff '<text>'`: backslashes, `$` and `^`
+    for screen's own escape/variable/caret processing (`^X` would become Ctrl-X),
+    and `'` for the single-quoted shell argument. Screen then types the text literally.
+    """
+    return (text.replace("\\", "\\\\").replace("$", "\\$").replace("^", "\\^")
+                .replace("'", "'\\''"))
+
+
+# ---------------------------------------------------------------------
+# File-name conventions shared by the tools and the exit artifacts
+# ---------------------------------------------------------------------
+
+def resolve_write_target(args: Dict[str, Any]) -> str:
+    """The path a write_to_file call targets, resolving the tool's aliases in the
+    same order write_to_file itself does."""
+    if not isinstance(args, dict):
+        return ""
+    return str(args.get("file_path") or args.get("path") or args.get("filename") or "")
+
+
+def is_dockerfile_name(path: str) -> bool:
+    """True if `path` names a Dockerfile (`Dockerfile` or `*.dockerfile`), matching
+    write_to_file's detection (normpath + basename, case-insensitive)."""
+    if not path:
+        return False
+    base = os.path.basename(os.path.normpath(str(path))).lower()
+    return base == "dockerfile" or base.endswith(".dockerfile")
+
+
+# ---------------------------------------------------------------------
+# Commit pinning
+# ---------------------------------------------------------------------
+
+def pinned_clone_snippet(commit: str) -> str:
+    """
+    The one Dockerfile fragment for building at a pinned commit, shared by the agent
+    prompt, the summary generator and the tool error message so they cannot drift.
+    """
+    return (
+        "ARG REPO_URL\n"
+        "ARG PROJECT_DIR=project\n"
+        f"ARG COMMIT_SHA={commit}\n"
+        'RUN test -n "$REPO_URL" && git clone "$REPO_URL" "/app/$PROJECT_DIR" \\\n'
+        '    && git -C "/app/$PROJECT_DIR" checkout --detach "$COMMIT_SHA"\n'
+        "WORKDIR /app/${PROJECT_DIR}\n"
+    )
+
+
+_TEMPLATE_SHALLOW_CLONE = 'RUN test -n "$REPO_URL" && git clone --depth 1 "$REPO_URL" "$PROJECT_DIR"'
+
+
+def render_pinned_template(query: str, commit: str) -> str:
+    """
+    Rewrite the summary prompt's Dockerfile template for a pinned commit: the shallow
+    clone line becomes a full clone plus checkout at the commit, so the template the
+    knowledge model is told to reproduce is right by construction instead of being
+    contradicted by an appended instruction.
+    """
+    if not commit or _TEMPLATE_SHALLOW_CLONE not in query:
+        return query
+    replacement = (
+        f"ARG COMMIT_SHA={commit}\n"
+        'RUN test -n "$REPO_URL" && git clone "$REPO_URL" "/app/$PROJECT_DIR" \\\n'
+        '    && git -C "/app/$PROJECT_DIR" checkout --detach "$COMMIT_SHA"'
+    )
+    return query.replace(_TEMPLATE_SHALLOW_CLONE, replacement)
+
+
+def pinned_commit_of(agent: Any) -> str:
+    """The commit a run is pinned to ('' if none), via the agent's accessor when it
+    has one. The single reader used by the tools and the exit artifacts."""
+    fn = getattr(agent, "pinned_commit", None)
+    if callable(fn):
+        try:
+            return str(fn() or "").strip()
+        except Exception:
+            pass
+    return str(getattr(agent, "commit", "") or "").strip()

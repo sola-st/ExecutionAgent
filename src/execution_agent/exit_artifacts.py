@@ -12,10 +12,13 @@ generates artifacts that allow reproducing the successful setup:
 from __future__ import annotations
 
 import json
+import os
 import logging
 import stat
 from pathlib import Path
-from typing import Any, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
+
+from execution_agent.shared_utils import is_dockerfile_name, resolve_write_target, pinned_commit_of
 
 _LOG = logging.getLogger("execution_agent.exit_artifacts")
 
@@ -44,76 +47,184 @@ def _extract_dockerfile_content(agent: Any) -> Optional[str]:
 
     for target_name, location, actual_path, content in reversed(written_files):
         # Check if this is a Dockerfile
-        if target_name.lower() == "dockerfile" or target_name.lower().endswith(".dockerfile"):
+        if is_dockerfile_name(target_name):
             return content
 
     return None
 
 
-def _extract_container_commands(agent: Any) -> List[str]:
-    """
-    Extract the bash commands that were executed inside the container.
+def _is_dockerfile_write(tool: str, args: Dict[str, Any]) -> bool:
+    return tool == "write_to_file" and is_dockerfile_name(resolve_write_target(args))
 
-    Only includes linux_terminal commands that were executed after the container
-    was created.
 
-    Returns:
-        List of command strings.
+def _extract_container_steps(agent: Any) -> List[Dict[str, Any]]:
     """
-    commands_and_summary = getattr(agent, "commands_and_summary", [])
-    commands = []
+    Everything that changed the container after it started, in execution order:
+      {"kind": "command", "command": str, "returncode": int|None}
+      {"kind": "write", "path": str, "content": str, "returncode": int|None}
+
+    Commands come from agent.command_history (recorded per cycle with the tool's
+    return code). "The container started" means the Dockerfile write that returned 0;
+    commands after a Dockerfile write that failed to build ran in pre-container mode
+    and are skipped. Files the model wrote INTO the container with write_to_file are
+    replayed too: live, a run patched tests/conftest.py and a pytest internal before
+    its final test command, and a replay of the commands alone could not reproduce it.
+    Their content comes from agent.written_files (command_history keeps only a
+    length marker for bulk payloads).
+
+    Falls back to commands_and_summary (no exit codes, no writes) so artifacts can be
+    regenerated from agent_state.json files written before command_history existed.
+    """
+    history = getattr(agent, "command_history", None) or []
+    container_writes = [
+        (target, dest, content)
+        for target, location, dest, content in getattr(agent, "written_files", []) or []
+        if location == "container"
+    ]
+    steps: List[Dict[str, Any]] = []
+
+    if history:
+        container_started = False
+        for entry in history:
+            tool = str(entry.get("tool", ""))
+            args = entry.get("args") or {}
+            rc = entry.get("returncode")
+            rc = rc if isinstance(rc, int) else None
+            if _is_dockerfile_write(tool, args):
+                if rc == 0:
+                    # A successful write means a (new) container: earlier steps ran in
+                    # a container that no longer exists.
+                    container_started = True
+                    steps = []
+                # rc != 0: either the build failed (no container yet) or the write was
+                # rejected because a container is already running. Neither changes
+                # which container the following steps run in.
+                continue
+            if not container_started:
+                continue
+            if tool == "linux_terminal":
+                # Prefer what actually ran (after the tool's preprocessing) over the
+                # model's raw text; skip the stuck-handler keywords, which are not
+                # shell commands.
+                command = str(entry.get("executed_command") or args.get("command", "") or "")
+                stripped = command.strip()
+                if not stripped or stripped.upper() in ("WAIT", "TERMINATE") or stripped.startswith("WRITE:"):
+                    continue
+                steps.append({"kind": "command", "command": command, "returncode": rc})
+            elif tool == "write_to_file" and rc == 0:
+                wanted = os.path.basename(os.path.normpath(resolve_write_target(args) or ""))
+                # Match the next container write with the same file name (writes are
+                # recorded in the same order as the cycles that made them).
+                for i, (target, dest, content) in enumerate(container_writes):
+                    if os.path.basename(os.path.normpath(target)) == wanted:
+                        container_writes.pop(i)
+                        steps.append({"kind": "write", "path": dest, "content": content, "returncode": rc})
+                        break
+        return steps
+
     container_started = False
-
-    for cmd_str, result in commands_and_summary:
-        # Check if this is when the container started (Dockerfile was written)
+    for cmd_str, result in getattr(agent, "commands_and_summary", []):
         if "write_to_file" in cmd_str.lower() and "dockerfile" in cmd_str.lower():
             container_started = True
             continue
-
-        # Extract linux_terminal commands after container started
         if container_started and cmd_str.startswith("Call to tool linux_terminal with arguments "):
             args_json = cmd_str[len("Call to tool linux_terminal with arguments "):]
             try:
                 args = json.loads(args_json)
                 command = args.get("command", "")
                 if command and command.strip():
-                    commands.append(command)
+                    steps.append({"kind": "command", "command": command, "returncode": None})
             except json.JSONDecodeError:
                 pass
+    return steps
 
-    return commands
+
+def _extract_container_commands(agent: Any) -> List[Tuple[str, Optional[int]]]:
+    """The shell commands from _extract_container_steps, as (command, returncode)."""
+    return [(st["command"], st["returncode"]) for st in _extract_container_steps(agent) if st["kind"] == "command"]
 
 
-def _generate_commands_script(commands: List[str], project_path: str) -> str:
+def _heredoc_delimiter(content: str, index: int) -> str:
+    delim = f"__EA_FILE_{index}__"
+    while delim in content:
+        delim += "_"
+    return delim
+
+
+def _generate_commands_script(steps: List[Any], project_path: str) -> str:
     """
-    Generate a bash script containing the commands executed inside the container.
+    Generate a bash script that replays, in order, what happened inside the container.
+
+    The script keeps going after a failing command. During the run the agent's shell
+    did the same: a command could fail (e.g. a test run under the wrong JDK) and a
+    later command fixed and repeated it, and the failing command often left state the
+    later one needs (packages installed before the step that failed). Aborting on the
+    first non-zero exit, as the previous `set -e` did, therefore never reached the
+    command that actually succeeded. Each command's exit code is printed next to the
+    code recorded during the run, and the script exits with the last command's status.
+    Files written into the container are replayed as heredocs at their place in the
+    sequence.
 
     Args:
-        commands: List of commands that were executed
+        steps: List of step dicts from _extract_container_steps; plain
+            (command, returncode) tuples are accepted too.
         project_path: The project path for context
-
-    Returns:
-        Bash script content
     """
+    entries: List[Dict[str, Any]] = []
+    for item in steps:
+        if isinstance(item, dict):
+            entries.append(item)
+        else:
+            entries.append({"kind": "command", "command": str(item[0]), "returncode": item[1]})
+
+    n_failed = sum(1 for e in entries if e.get("returncode") not in (None, 0))
+    n_writes = sum(1 for e in entries if e["kind"] == "write")
     lines = []
     lines.append("#!/usr/bin/env bash")
     lines.append("#")
-    lines.append("# Commands executed inside the container")
+    lines.append("# Commands executed inside the container during the agent run, in order,")
+    lines.append("# including the files the agent wrote into the container.")
     lines.append(f"# Project: {project_path}")
     lines.append("#")
-    lines.append("# This script contains the commands that were successfully executed")
-    lines.append("# inside the Docker container during the agent run.")
+    lines.append("# This script does NOT stop on errors. Commands that failed during the run are")
+    lines.append("# kept because later commands may depend on what they left behind (packages")
+    lines.append("# installed before the failing step, a virtualenv, ...). Each command's exit code")
+    lines.append("# is printed next to the code recorded during the run; the script's own exit")
+    lines.append("# status is that of the LAST command.")
+    if entries:
+        lines.append(f"# Recorded: {len(entries)} step(s), {n_writes} file write(s), {n_failed} with a non-zero exit during the run.")
+    else:
+        lines.append("# No commands were executed after the container was created.")
     lines.append("#")
     lines.append("")
-    lines.append("set -e  # Exit on error")
+    lines.append("set +e")
+    lines.append("_rc=0")
     lines.append("")
-
-    for i, cmd in enumerate(commands, 1):
-        lines.append(f"# Command {i}")
-        lines.append(cmd)
+    for i, e in enumerate(entries, 1):
+        rc = e.get("returncode")
+        recorded = "unknown" if rc is None else ("124, timed out / stuck" if rc == 124 else str(rc))
+        if e["kind"] == "write":
+            path = str(e["path"])
+            content = str(e.get("content") or "")
+            if not content.endswith("\n"):
+                content += "\n"
+            delim = _heredoc_delimiter(content, i)
+            lines.append(f"# Command {i}: write file {path} (exit code during the run: {recorded})")
+            lines.append(f"mkdir -p {_shell_quote(os.path.dirname(path) or '.')} && cat > {_shell_quote(path)} <<'{delim}'")
+            lines.append(content.rstrip("\n"))
+            lines.append(delim)
+            lines.append(f"_rc=$?; echo \"[commands.sh] command {i} (write {path}) exited with $_rc (during the run: {recorded})\" >&2")
+        else:
+            lines.append(f"# Command {i} (exit code during the run: {recorded})")
+            lines.append(str(e["command"]))
+            lines.append(f"_rc=$?; echo \"[commands.sh] command {i} exited with $_rc (during the run: {recorded})\" >&2")
         lines.append("")
+    lines.append("exit $_rc")
+    return "\n".join(lines) + "\n"
 
-    return "\n".join(lines)
+
+def _shell_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
 
 
 def _generate_launch_script(
@@ -122,6 +233,7 @@ def _generate_launch_script(
     project_path: str,
     docker_tag: str = "",
     project_url: str = "",
+    commit: str = "",
 ) -> str:
     """
     Generate a launch.sh script that builds the Docker image and runs the commands.
@@ -157,7 +269,9 @@ def _generate_launch_script(
     lines.append("#   --keep-container: Don't remove the container after execution")
     lines.append("#")
     lines.append("")
-    lines.append("set -e  # Exit on error")
+    # No `set -e`: build/exec statuses are checked explicitly below, and commands.sh
+    # deliberately exits with its LAST command's status, which may be non-zero.
+    lines.append("set +e")
     lines.append("set -u  # Exit on undefined variable")
     lines.append("")
     lines.append("# Parse arguments")
@@ -178,6 +292,8 @@ def _generate_launch_script(
     lines.append(f"DOCKER_TAG='{_escape_bash_string(tag)}'")
     if project_url:
         lines.append(f"REPO_URL='{_escape_bash_string(project_url)}'")
+    if commit:
+        lines.append(f"COMMIT_SHA='{_escape_bash_string(commit)}'")
     lines.append(f'DOCKERFILE_PATH="$SCRIPT_DIR/{dockerfile_path}"')
     lines.append(f'COMMANDS_SCRIPT="$SCRIPT_DIR/{commands_script_path}"')
     lines.append('CONTAINER_ID=""')
@@ -205,16 +321,18 @@ def _generate_launch_script(
     lines.append("echo ''")
     lines.append("")
     lines.append('DOCKERFILE_DIR="$(dirname "$DOCKERFILE_PATH")"')
+    # Build args mirror the agent's own build. Harmless if the Dockerfile does not
+    # declare them: docker only warns about unused build args.
+    build_args = ""
     if project_url:
-        # Harmless if the Dockerfile hardcodes the URL: docker only warns about
-        # build args it does not declare.
-        lines.append('docker build --build-arg REPO_URL="$REPO_URL" -t "$DOCKER_TAG" "$DOCKERFILE_DIR"')
-    else:
-        lines.append('docker build -t "$DOCKER_TAG" "$DOCKERFILE_DIR"')
+        build_args += ' --build-arg REPO_URL="$REPO_URL"'
+    if commit:
+        build_args += ' --build-arg COMMIT_SHA="$COMMIT_SHA"'
+    lines.append(f'docker build{build_args} -t "$DOCKER_TAG" "$DOCKERFILE_DIR"')
     lines.append("")
     lines.append("BUILD_STATUS=$?")
     lines.append("if [ $BUILD_STATUS -ne 0 ]; then")
-    lines.append("  echo 'ERROR: Docker build failed with exit code $BUILD_STATUS'")
+    lines.append('  echo "ERROR: Docker build failed with exit code $BUILD_STATUS"')
     lines.append("  exit $BUILD_STATUS")
     lines.append("fi")
     lines.append("echo 'Docker image built successfully.'")
@@ -311,20 +429,13 @@ def generate_exit_artifacts(
     log.info(f"Saved Dockerfile to: {dockerfile_path}")
 
     # 2. Extract and save container commands
-    commands = _extract_container_commands(agent)
-    if commands:
-        commands_script = _generate_commands_script(commands, project_path)
-        commands_path = artifacts_dir / "commands.sh"
-        commands_path.write_text(commands_script, encoding="utf-8")
-        commands_path.chmod(commands_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        log.info(f"Saved commands script to: {commands_path} ({len(commands)} commands)")
-    else:
-        # Create an empty commands script with a placeholder
-        commands_script = _generate_commands_script(["# No commands were executed after container creation"], project_path)
-        commands_path = artifacts_dir / "commands.sh"
-        commands_path.write_text(commands_script, encoding="utf-8")
-        commands_path.chmod(commands_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        log.info(f"Saved empty commands script to: {commands_path}")
+    commands = _extract_container_steps(agent)
+    # An empty list still yields a valid script (header, `set +e`, `exit 0`).
+    commands_script = _generate_commands_script(commands, project_path)
+    commands_path = artifacts_dir / "commands.sh"
+    commands_path.write_text(commands_script, encoding="utf-8")
+    commands_path.chmod(commands_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    log.info(f"Saved commands script to: {commands_path} ({len(commands)} commands)")
 
     # 3. Generate and save launch script
     docker_tag = getattr(agent, "docker_tag", "")
@@ -334,6 +445,7 @@ def generate_exit_artifacts(
         project_path=project_path,
         docker_tag=docker_tag,
         project_url=str(getattr(agent, "project_url", "") or ""),
+        commit=pinned_commit_of(agent),
     )
     launch_path = artifacts_dir / "launch.sh"
     launch_path.write_text(launch_script, encoding="utf-8")
@@ -345,6 +457,7 @@ def generate_exit_artifacts(
         "project_path": project_path,
         "project_url": getattr(agent, "project_url", ""),
         "docker_tag": docker_tag,
+        "commit": pinned_commit_of(agent),
         "num_commands": len(commands),
         "files": [
             "Dockerfile",

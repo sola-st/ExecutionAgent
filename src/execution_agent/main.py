@@ -70,7 +70,7 @@ from execution_agent.tools import (
     search_docker_image,
     goals_accomplished,
 )
-from execution_agent.context import ContextBuilder
+from execution_agent.context import ContextBuilder, RepositoryUnavailable
 
 
 # -------------------------
@@ -560,6 +560,7 @@ def _run_forced_exit_cycle(
     workspace_root: str,
     run_dir: Path,
     log: logging.Logger,
+    commit: str = "",
 ) -> bool:
     """
     Forced exit cycle: Ask knowledge model to produce a final Dockerfile + bash script
@@ -615,6 +616,7 @@ def _run_forced_exit_cycle(
 PROJECT INFORMATION:
 - Project: {project_path}
 - Repository URL: {project_url}
+- Required commit: {commit if commit else "default branch HEAD"}
 - Language: {getattr(repo_context, 'language', 'unknown') if repo_context else 'unknown'}
 
 PREVIOUS ATTEMPT LESSONS:
@@ -633,7 +635,8 @@ Based on ALL the information above, produce:
 
 IMPORTANT REQUIREMENTS:
 - The Dockerfile should be based on Ubuntu (ubuntu:22.04 or ubuntu:24.04)
-- The Dockerfile must install git and clone the repository
+- The Dockerfile must install git and clone the repository{f" with full history and `git checkout --detach {commit}` (a shallow clone cannot reach that commit)" if commit else ""}
+- Declare `ARG REPO_URL` and `ARG COMMIT_SHA` without defaults if you use them; both are passed as build args
 - The bash script should be executable inside the container
 - Include all necessary system dependencies
 - Handle common issues that were encountered in previous attempts
@@ -729,7 +732,10 @@ Provide ONLY these two code blocks. The Dockerfile and bash script must be compl
 
         # Build the Docker image
         build_result = subprocess.run(
-            ["docker", "build", "-t", docker_tag, "-f", str(dockerfile_path), str(forced_exit_dir)],
+            ["docker", "build",
+             *(["--build-arg", f"REPO_URL={project_url}"] if project_url else []),
+             *(["--build-arg", f"COMMIT_SHA={commit}"] if commit else []),
+             "-t", docker_tag, "-f", str(dockerfile_path), str(forced_exit_dir)],
             capture_output=True,
             text=True,
             timeout=600,  # 10 minute timeout for build
@@ -805,7 +811,7 @@ def main() -> int:
     project_path = meta["project_path"]
     project_url = meta["project_url"]
     language = meta.get("language", "unknown")
-    commit = str(meta.get("commit", "") or "")
+    commit = str(meta.get("commit", "") or "").strip()
 
     # Run directory for logs/transcripts
     if args.run_log_dir:
@@ -893,15 +899,24 @@ def main() -> int:
 
     LOG.info("Building repository context (cloning repo, finding workflows, requirements, README)...")
     ctx_builder = ContextBuilder(workspace_root=args.workspace_root)
-    repo_context = ctx_builder.build_repo_context(
-        model=model,
-        knowledge_model=knowledge_model,
-        project_path=project_path,
-        project_url=project_url,
-        language=language,
-        search_workflows_summary_prompt=search_workflows_summary,
-        commit=commit,
-    )
+    try:
+        repo_context = ctx_builder.build_repo_context(
+            model=model,
+            knowledge_model=knowledge_model,
+            project_path=project_path,
+            project_url=project_url,
+            language=language,
+            search_workflows_summary_prompt=search_workflows_summary,
+            commit=commit,
+        )
+    except RepositoryUnavailable as e:
+        LOG.error("=" * 70)
+        LOG.error("ABORTING RUN: the project repository could not be cloned.")
+        for line in str(e).splitlines():
+            LOG.error(line)
+        LOG.error("No LLM call was made. Fix the cause and rerun this project.")
+        LOG.error("=" * 70)
+        return 3
     LOG.info("Repository context built successfully")
 
     tools_doc_path = pf / "tools_list"
@@ -956,6 +971,7 @@ def main() -> int:
     agent.language_guidelines = language_guidelines
     agent.written_files = []
     agent.commands_and_summary = []
+    agent.command_history = []
 
     # State used by the upgraded tools
     agent.command_stuck = False
@@ -1082,6 +1098,7 @@ def main() -> int:
                         workspace_root=args.workspace_root,
                         run_dir=run_dir,
                         log=LOG,
+                        commit=commit,
                     )
                     if forced_exit_success:
                         LOG.info("✅ Forced exit cycle succeeded!")
@@ -1118,6 +1135,7 @@ def main() -> int:
 
             # Reset volatile state
             agent.commands_and_summary = []
+            agent.command_history = []
             agent.written_files = []
             agent.messages = []
             agent.cycle_count = 0
@@ -1131,6 +1149,11 @@ def main() -> int:
             agent.stuck_commands = []
             agent.container = None
             agent.docker_tag = ""
+            try:
+                agent.env.container_id = None   # write_to_file sets it; _get_container falls back to it
+            except Exception:
+                pass
+            agent.base_dockerfile = ""     # authoritative Dockerfile for exit artifacts; must not leak across attempts
 
             # Restore preserved state
             agent.previous_attempts = saved_attempts

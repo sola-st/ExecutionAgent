@@ -221,12 +221,41 @@ cat test_output.log  # See if tests actually ran
 | `--create-meta` | Create metadata files only | - |
 | `--language`, `-L` | Filter by language (for --list) | - |
 | `--model`, `-m` | Model to use | `gpt-4o-mini` |
+| `--knowledge-model` | Knowledge model for web search/summaries (passed through to the agent) | agent default |
+| `--projects-file`, `-P` | JSON file with extra projects (see below); same-named entries replace built-ins | - |
+| `--commit` | Pin the single selected project to a commit SHA | default branch HEAD |
 | `--step-limit`, `-s` | Step limit per attempt | `40` |
 | `--max-retries`, `-R` | Maximum retries | `2` |
 | `--workspace-root`, `-w` | Workspace directory | `./execution_agent_workspace` |
 | `--parallel`, `-p` | Number of parallel projects | `1` |
 | `--dry-run`, `-n` | Show what would run | - |
 | `--verbose`, `-v` | Show agent output in terminal | - |
+
+### Pinning Projects to a Commit
+
+By default a project is built at its default branch HEAD. To build at a specific
+revision, pin it: `--commit <sha>` for a single project, or a `--projects-file`
+for a benchmark of (repository, commit) pairs. Names must be unique, so the same
+repository can appear several times under different names:
+
+```json
+[
+  {"name": "commons-csv@2d6a1f0", "url": "https://github.com/apache/commons-csv",
+   "language": "Java", "commit": "2d6a1f0c1b7d4a3e9f8e7d6c5b4a3f2e1d0c9b8a"},
+  {"name": "commons-csv@9c3e5b1", "url": "https://github.com/apache/commons-csv",
+   "language": "Java", "commit": "9c3e5b1a2d4f6e8c0b1a3d5f7e9c1b3a5d7f9e1c"}
+]
+```
+
+```bash
+python launcher.py --projects-file benchmark.json --run commons-csv@2d6a1f0,commons-csv@9c3e5b1
+python launcher.py --run scipy --commit 1a2b3c4d          # pin a built-in project
+```
+
+`image_tag` is optional and defaults to `<safe_name>_image:ExecutionAgent`. When a
+commit is set, the preparation phase makes a full clone and checks the SHA out
+(a shallow clone cannot reach an arbitrary commit), and the agent is instructed to
+build the container at that same revision.
 
 ### Project Metadata Format
 
@@ -239,6 +268,7 @@ Create a JSON file with project information:
   "project_url": "https://github.com/username/my_project",
   "language": "Python",
   "image_tag": "my_project_image:latest",
+  "commit": "",
   "budget": 40
 }
 ```
@@ -250,6 +280,7 @@ Create a JSON file with project information:
 | `project_url` | Git repository URL |
 | `language` | Primary language (Python, Java, Javascript, C, C++) |
 | `image_tag` | Optional Docker image tag |
+| `commit` | Optional commit SHA to build at; empty means default branch HEAD |
 | `budget` | Maximum execution cycles (steps) |
 
 ### Available Tools

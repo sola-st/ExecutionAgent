@@ -27,6 +27,11 @@ from execution_agent.shared_utils import (
     convert_xml_file_to_yaml,
     strip_ansi_codes,
     get_docker_client,
+    screen_staging_script,
+    stuff_escape,
+    pinned_commit_of,
+    is_dockerfile_name,
+    pinned_clone_snippet,
     get_metrics_collector,
     timed_tool,
     SCREEN_SESSION,
@@ -348,18 +353,18 @@ def exec_in_screen_and_get_log(container: DockerContainer, cmd: str) -> Tuple[in
         time.sleep(0.3)
         return 0, "The shell has been renewed (exec /bin/bash -l).", logfile, False
 
-    _exec(container, f"cat > {shlex.quote(script)} <<'{delim}'\n{cmd}\n{delim}\nchmod +x {shlex.quote(script)}")
-    _exec(container, f": > {shlex.quote(logfile)}")
+    # One exec (under `set -e`) stages the script, truncates the log and writes the
+    # per-command wrapper. See shared_utils.screen_staging_script for why.
+    wrapper, staging = screen_staging_script(run_id, logfile, script, cmd, source=True)
+    stage_rc, stage_out = _exec(container, staging)
+    if stage_rc != 0:
+        # Fail fast instead of waiting THRESH seconds for a marker that can never appear.
+        return 1, f"Could not stage the command inside the container (docker exec failed): {stage_out.strip()[:300]}", logfile, False
 
     _exec(container, f"screen -S {shlex.quote(SCREEN_SESSION)} -X logfile flush 1 >/dev/null 2>&1 || true")
 
-    payload = (
-        f'printf "%s\\n" "{BEGIN}" >> {logfile}; '
-        f'if . {script} >> {logfile} 2>&1; then __rc=0; else __rc=$?; fi; '
-        f'printf "%s\\n" "{END}" >> {logfile}; '
-        f'printf "<<RC:{run_id}:%d>>\\n" "$__rc" >> {logfile}'
-    )
-    _stuff_single_quoted(SCREEN_SESSION, payload)
+    # The only text ever typed into screen: no `$`, no quotes, no arguments.
+    _stuff_single_quoted(SCREEN_SESSION, f". {wrapper}")
 
     last_buf = ""
     last_change = time.time()
@@ -408,8 +413,7 @@ def exec_in_screen_and_get_log(container: DockerContainer, cmd: str) -> Tuple[in
         region = "\n".join(region_lines)
 
     region = "\n".join(ln for ln in region.splitlines() if not ln.startswith("<<RC:")).strip()
-    _exec(container, f"rm -f {shlex.quote(script)}")
-
+    # The wrapper removed the script and itself; nothing to clean up here.
     return (rc if rc is not None else 0), region, logfile, False
 
 
@@ -484,27 +488,19 @@ def _reset_screen_state(agent) -> None:
 
 def _probe_screen_via_log(container: DockerContainer, session_name: str, timeout: float = SCREEN_HEALTH_TIMEOUT) -> bool:
     run_id = uuid.uuid4().hex
-    logfile = f"/tmp/screen_health_{run_id}.log"
+    # Fixed log name: the RC marker carries the run_id, so stale content cannot match,
+    # and the probe (which runs before every command) leaves no per-call files behind.
+    logfile = "/tmp/screen_health.log"
     script = f"/tmp/screen_health_{run_id}.sh"
     RC_MARK = f"<<RC:{run_id}:"
 
-    create_script = (
-        f"cat > {script} <<'EOF'\n{SCREEN_HEALTH_CMD}\nEOF\n"
-        f"chmod +x {script}\n"
-        f": > {logfile}\n"
-    )
-    rc, _ = _exec(container, create_script)
+    wrapper, staging = screen_staging_script(run_id, logfile, script, SCREEN_HEALTH_CMD, source=False)
+    rc, _ = _exec(container, staging)
     if rc != 0:
         return False
 
-    payload = (
-        f'printf "%s\\n" "<<BEGIN:{run_id}>>" >> {logfile}; '
-        f'/usr/bin/env bash {script} >> {logfile} 2>&1; __rc=$?; '
-        f'printf "%s\\n" "<<END:{run_id}>>" >> {logfile}; '
-        f'printf "<<RC:{run_id}:%d>>\\n" "$__rc" >> {logfile}'
-    )
-    safe_payload = payload.replace("'", r"'\''")
-    _exec(container, f"screen -S {session_name} -X stuff '{safe_payload}\\r'")
+    # No `$` is ever typed into screen: see shared_utils.screen_staging_script.
+    _exec(container, f"screen -S {session_name} -X stuff '. {wrapper}\\r'")
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -642,7 +638,8 @@ def _handle_stuck(command: str, agent) -> Optional[str]:
 
     if command.startswith("WRITE:"):
         user_input = command.split("WRITE:", 1)[1]
-        _exec(container, f"screen -S {SCREEN_SESSION} -X stuff '{user_input}\\n'")
+        # Free text: escape `$`, `\\` and `'` so screen types it literally.
+        _exec(container, f"screen -S {SCREEN_SESSION} -X stuff '{stuff_escape(user_input)}\\n'")
         finished, output = _progress_aware_wait(after_write=True)
         if finished:
             agent.command_stuck = False
@@ -885,6 +882,10 @@ def linux_terminal(command: str, agent, cwd: str = "", timeout: int | None = Non
         dict with 'output' and 'returncode' keys
     """
     cmd = _preprocess_command((command or "").strip())
+    try:
+        agent.last_executed_command = cmd   # what really ran; picked up by the cycle loop for command_history
+    except Exception:
+        pass
 
     if err := _validate_and_block_interactive(cmd):
         return {"output": err, "returncode": 1}
@@ -1097,7 +1098,7 @@ def read_file(file_path: str, agent) -> dict[str, Any]:
 from datetime import datetime as _dt
 
 
-def _docker_build_image(dockerfile_dir: str, tag: str, repo_url: str = "") -> tuple[bool, str]:
+def _docker_build_image(dockerfile_dir: str, tag: str, repo_url: str = "", commit: str = "") -> tuple[bool, str]:
     """
     Build an image and return (ok, full_build_log_text).
 
@@ -1110,6 +1111,8 @@ def _docker_build_image(dockerfile_dir: str, tag: str, repo_url: str = "") -> tu
     """
     client = _docker_client()
     build_args = {"REPO_URL": repo_url} if repo_url else {}
+    if commit:
+        build_args["COMMIT_SHA"] = commit   # fills an `ARG COMMIT_SHA` declared without a default
 
     def _ts() -> str:
         return _dt.now().strftime("%H:%M:%S")
@@ -1190,6 +1193,86 @@ def _docker_build_image(dockerfile_dir: str, tag: str, repo_url: str = "") -> tu
             _log(f"CAUSED BY: {type(e.__cause__).__name__}: {e.__cause__}")
 
         return False, "\n".join(log_lines)
+
+
+def _pinned_commit(agent) -> str:
+    """See shared_utils.pinned_commit_of."""
+    return pinned_commit_of(agent)
+
+
+def _normalize_repo_url(url: str) -> str:
+    u = (url or "").strip().lower().rstrip("/")
+    u = re.sub(r"^(https?://|git@|ssh://git@|git://)", "", u).replace(":", "/")
+    return u[:-4] if u.endswith(".git") else u
+
+
+def _verify_pinned_commit(container: DockerContainer, commit: str, project_path: str = "", project_url: str = "") -> tuple[str, str]:
+    """
+    Check that the freshly started container actually sits at the pinned commit.
+
+    The prompt asks the model to clone and `git checkout --detach` the commit, but a
+    Dockerfile that clones successfully and forgets the checkout builds the default
+    branch instead - silently, since the build succeeds. Observed live with gpt-5-mini.
+    This makes the pin deterministic instead of advisory.
+
+    Every git checkout in the usual places is inspected (the working directory,
+    /app/<project_path>, /app/*, direct subdirectories), so a dependency clone that
+    sorts first cannot be mistaken for the project. The project checkout is the one
+    where git resolves the pin, else the one whose origin URL is the project URL,
+    else the only checkout there is. `commit` may be a full/abbreviated SHA in any
+    case, a tag or a branch: git resolves it inside the checkout.
+
+    Returns (status, detail) with status one of "ok", "mismatch", "unverifiable"
+    (no git checkout found, e.g. a source tarball, or several checkouts none of
+    which can be tied to the project - reported, never punished).
+    """
+    candidates = "."
+    if project_path:
+        candidates += " " + shlex.quote(f"/app/{project_path.strip('/')}")
+    candidates += " /app/* */"
+    pin = shlex.quote(commit)
+    probe = (
+        f"for d in {candidates}; do "
+        '[ -d "$d/.git" ] || continue; '
+        'r=$(cd "$d" && pwd -P) || continue; '
+        'h=$(git -C "$d" rev-parse --verify HEAD 2>/dev/null) || continue; '
+        f'p=$(git -C "$d" rev-parse --verify {pin}^{{commit}} 2>/dev/null); '
+        'u=$(git -C "$d" config --get remote.origin.url 2>/dev/null); '
+        'printf "DIR=%s HEAD=%s PIN=%s URL=%s\\n" "$r" "$h" "$p" "$u"; '
+        "done; echo PROBE-DONE"
+    )
+    rc, out = _exec(container, probe, timeout=30)
+    found = {}
+    for m in re.finditer(r"DIR=(\S+) HEAD=([0-9a-f]{40}) PIN=([0-9a-f]{40})? ?URL=(\S*)", out or ""):
+        found.setdefault(m.group(1), (m.group(2), m.group(3) or "", m.group(4) or ""))
+    if rc != 0 or "PROBE-DONE" not in (out or ""):
+        return "unverifiable", f"could not inspect the container: {(out or '').strip()[:200]}"
+    if not found:
+        return "unverifiable", f"no git checkout found in the container (looked in {candidates})"
+
+    def compare(where, head, pin_sha):
+        if pin_sha:
+            return ("ok", head) if head == pin_sha else ("mismatch", f"{head} (in {where})")
+        if re.fullmatch(r"[0-9a-fA-F]{4,40}", commit) and head.startswith(commit.lower()):
+            return "ok", head
+        return "mismatch", f"{head} (in {where}; '{commit}' is not a known ref there)"
+
+    # 1. a checkout where the pin resolves and is HEAD
+    for where, (head, pin_sha, _) in found.items():
+        if pin_sha and head == pin_sha:
+            return "ok", head
+    # 2. the checkout of the project repository itself
+    want = _normalize_repo_url(project_url)
+    if want:
+        for where, (head, pin_sha, url) in found.items():
+            if _normalize_repo_url(url) == want:
+                return compare(where, head, pin_sha)
+    # 3. only one checkout: it must be the project
+    if len(found) == 1:
+        (where, (head, pin_sha, _)), = found.items()
+        return compare(where, head, pin_sha)
+    listing = ", ".join(f"{w}@{h[:12]}" for w, (h, _, _) in found.items())
+    return "unverifiable", f"several git checkouts, none at the pin and none with origin {project_url or '?'}: {listing}"
 
 
 def _docker_start_container(tag: str) -> Optional[DockerContainer]:
@@ -1278,7 +1361,7 @@ def write_to_file(
 
     normalized = os.path.normpath(target)
     base = os.path.basename(normalized)
-    is_dockerfile = base.lower() == "dockerfile" or base.lower().endswith(".dockerfile")
+    is_dockerfile = is_dockerfile_name(normalized)
 
     if is_dockerfile and "COPY " in data:
         return {
@@ -1356,8 +1439,11 @@ def write_to_file(
                 # Store the docker tag for trace generation
                 agent.docker_tag = tag
 
+                pinned = _pinned_commit(agent)
                 ok, build_log = _docker_build_image(
-                    str(dockerfile_dir), tag, repo_url=str(getattr(agent, "project_url", "") or "")
+                    str(dockerfile_dir), tag,
+                    repo_url=str(getattr(agent, "project_url", "") or ""),
+                    commit=pinned,
                 )
                 if not ok:
                     # Return the FULL build log to the LLM for complete context
@@ -1394,6 +1480,52 @@ def write_to_file(
                         ),
                         "returncode": 1,
                     }
+
+                pinned_note = ""
+                if pinned:
+                    status, detail = _verify_pinned_commit(
+                        c, pinned,
+                        project_path=str(getattr(agent, "project_path", "") or ""),
+                        project_url=str(getattr(agent, "project_url", "") or ""),
+                    )
+                    if status == "mismatch":
+                        # Discard container AND image: the tag is unique per build and
+                        # nothing else would ever remove it.
+                        try:
+                            c.remove(force=True)
+                        except Exception:
+                            pass
+                        try:
+                            _docker_client().images.remove(tag, force=True)
+                        except Exception:
+                            pass
+                        agent.docker_tag = ""
+                        return {
+                            "output": _result(
+                                False,
+                                f"Container is NOT at the required commit {pinned}",
+                                details=f"`git rev-parse HEAD` inside the container returned {detail}.\n"
+                                        f"The image was built and started, but it has been discarded because "
+                                        f"the task requires commit {pinned}.",
+                                why=[
+                                    "The Dockerfile cloned the repository but never checked out the required commit, "
+                                    "so the container holds the default branch HEAD.",
+                                    "A shallow clone (`--depth 1`) cannot reach an arbitrary commit.",
+                                ],
+                                try_next=[
+                                    "Clone with full history and check the commit out, e.g.:\n" + pinned_clone_snippet(pinned),
+                                    "Then write the Dockerfile again.",
+                                ],
+                            ),
+                            "returncode": 1,
+                        }
+                    if status == "ok":
+                        pinned_note = f"Verified: container HEAD is the required commit {pinned}."
+                    else:
+                        pinned_note = (
+                            f"WARNING: could not verify the pinned commit {pinned} - {detail}. "
+                            "If the source was fetched as a tarball, make sure it is the archive of exactly that commit."
+                        )
 
                 agent.container = c
                 agent.base_dockerfile = data
@@ -1435,6 +1567,8 @@ def write_to_file(
                     "We cannot change it. We cannot create another container. We cannot log out of it. These are the rules "
                     "and should not be changed, otherwise I would fail the task."
                 )
+                if pinned_note:
+                    msg += "\n\n" + pinned_note
                 if extra_docs.strip():
                     msg += "\n\n" + extra_docs
                 if expected.strip():

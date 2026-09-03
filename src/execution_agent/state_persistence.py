@@ -31,6 +31,7 @@ class AgentState:
     """
     # Execution history
     commands_and_summary: List[Tuple[str, Dict[str, Any]]] = field(default_factory=list)
+    command_history: List[Dict[str, Any]] = field(default_factory=list)  # {cycle, tool, args, returncode}
     written_files: List[Tuple[str, str, str, str]] = field(default_factory=list)  # (target, location, path, content)
 
     # Docker state
@@ -185,6 +186,7 @@ class StatePersistence:
         try:
             # Restore execution history
             agent.commands_and_summary = list(state.commands_and_summary)
+            agent.command_history = list(getattr(state, "command_history", []) or [])
             agent.written_files = list(state.written_files)
 
             # Restore cycle count
@@ -224,6 +226,7 @@ class StatePersistence:
 
         return AgentState(
             commands_and_summary=list(getattr(agent, "commands_and_summary", [])),
+            command_history=list(getattr(agent, "command_history", []) or []),
             written_files=list(getattr(agent, "written_files", [])),
             docker_tag=getattr(agent, "docker_tag", ""),
             container_id=container_id,

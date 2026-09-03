@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from .exceptions import BudgetExhausted, FormatError, GoalsAccomplished
 from .repetition import is_repetition
 from .state_persistence import StatePersistence, save_agent_state_periodically
+from execution_agent.shared_utils import pinned_clone_snippet
 
 if TYPE_CHECKING:
     from .tools import ToolRegistry  # type-only to avoid circular imports
@@ -207,6 +208,25 @@ class _Message:
     tag: Optional[str] = None
 
 
+_BULK_ARG_KEYS = ("content", "text", "data")
+
+
+def _slim_args(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Copy of a tool call's args for command_history without bulk payloads. Exit
+    artifacts only need `command` (linux_terminal) and the target path of
+    write_to_file; the file content itself is already kept in written_files, and the
+    state file is rewritten every cycle, so carrying it here again would triple it.
+    """
+    slim: Dict[str, Any] = {}
+    for k, v in (args or {}).items():
+        if k in _BULK_ARG_KEYS and isinstance(v, str):
+            slim[k] = f"<{len(v)} chars omitted>"
+        else:
+            slim[k] = v
+    return slim
+
+
 class ExecutionAgent:
     """
     Workflow (unchanged):
@@ -243,11 +263,20 @@ class ExecutionAgent:
 
         # state (carry-overs)
         self.commands_and_summary: List[tuple[str, Dict[str, Any]]] = []
+        # Per-cycle execution record incl. the tool's exit code. commands_and_summary only
+        # keeps the LLM's summary, which is why exit artifacts could not tell which
+        # commands had actually failed.
+        self.command_history: List[Dict[str, Any]] = []  # {cycle, tool, args, returncode}
         self.written_files: List[tuple[str, str, str, str]] = []  # (target, location, path, content)
         self.prompt_text: str = ""
 
         # runtime substrate (set by tools)
         self.container = None
+        # Dockerfile that last built an image AND started a container (set by write_to_file).
+        # Authoritative source for exit artifacts; must be reset between retry attempts.
+        self.base_dockerfile: str = ""
+        self.commit: str = ""   # pinned commit, set by main.py; see pinned_commit()
+        self.last_executed_command: Optional[str] = None   # set by linux_terminal (post-preprocessing)
 
         # injected by main.py after init
         self.workspace_path: str = ""
@@ -312,6 +341,36 @@ class ExecutionAgent:
     # -------------------------
     # prompt construction
     # -------------------------
+    def pinned_commit(self) -> str:
+        """The commit this run is pinned to ('' if none): from the repo context when
+        it carries one, else from the attribute main.py sets. Single source for the
+        prompt and for the tools."""
+        ctx_commit = getattr(self.repo_context, "commit", None) if self.repo_context is not None else None
+        return str(ctx_commit or getattr(self, "commit", "") or "").strip()
+
+    @staticmethod
+    def _pinned_commit_section(pinned: str) -> str:
+        """Prompt section requiring the build to happen at a specific commit.
+
+        Placed after the setup summary on purpose: the summary's Dockerfile template
+        uses `git clone --depth 1`, which cannot reach an arbitrary commit, and this
+        section must be the instruction the model sees last.
+        """
+        return (
+            "=" * 80 + "\n"
+            f"REQUIRED COMMIT: {pinned}\n"
+            + "=" * 80 + "\n"
+            "This task targets that exact commit, not the default branch. This OVERRIDES the "
+            "clone step shown in the setup summary above: do NOT use `git clone --depth 1` - a "
+            "shallow clone of the default branch will not contain this commit. Your Dockerfile "
+            "must clone with full history and check the commit out, e.g.:\n"
+            "```dockerfile\n"
+            + pinned_clone_snippet(pinned) +
+            "```\n"
+            "Verify with `git rev-parse HEAD` before running the tests, and build/test the code "
+            "at this commit."
+        )
+
     def _build_instance_prompt(self, task: str) -> str:
         ctx = self.repo_context
 
@@ -321,22 +380,9 @@ class ExecutionAgent:
             parts.append(f"Project URL: {ctx.project_url}")
             parts.append(f"Primary language: {ctx.language}")
 
-            pinned = getattr(ctx, "commit", None) or getattr(self, "commit", "")
+            pinned = self.pinned_commit()
             if pinned:
-                parts.append("")
-                parts.append(f"REQUIRED COMMIT: {pinned}")
-                parts.append(
-                    "This task targets that exact commit, not the default branch. Your Dockerfile "
-                    "must clone with full history and check it out, e.g.:\n"
-                    "```dockerfile\n"
-                    "ARG REPO_URL\n"
-                    f"ARG COMMIT_SHA={pinned}\n"
-                    'RUN git clone "$REPO_URL" repo && cd repo && git checkout --detach "$COMMIT_SHA"\n'
-                    "```\n"
-                    "Do NOT use `git clone --depth 1` alone - a shallow clone of the default branch "
-                    "will not contain this commit. Verify with `git rev-parse HEAD` before running "
-                    "the tests, and build/test the code at this commit."
-                )
+                parts.append(f"Required commit: {pinned} (details below the setup summary)")
             parts.append("")
 
             # Add language-specific guidelines if available
@@ -398,6 +444,12 @@ class ExecutionAgent:
                 parts.append("```")
                 parts.append(ctx.unified_summary)
                 parts.append("```")
+                parts.append("")
+
+            # Pinned commit goes AFTER the summary so it overrides the summary's
+            # generic `git clone --depth 1` template rather than being contradicted by it.
+            if pinned:
+                parts.append(self._pinned_commit_section(pinned))
                 parts.append("")
 
         # Add previous attempts section if available
@@ -862,9 +914,14 @@ You are an AI assistant specialized in automatically setting up a given project 
         result = self.tool_registry.call(name, args, agent=self)
         _LOG.info(f"[EXECUTE] Tool '{name}' completed, result length: {len(str(result))} chars")
 
+        # Propagate the tool's own return code (e.g. the shell exit status from
+        # linux_terminal) instead of a constant 0, so command_history and the exit
+        # artifacts know which commands actually failed. The text the model sees is
+        # unchanged.
+        rc = result.get("returncode", 0) if isinstance(result, dict) else 0
         return {
             "output": str(result),
-            "returncode": 0,
+            "returncode": int(rc) if isinstance(rc, int) and not isinstance(rc, bool) else 0,
             "tool_name": name,
             "tool_args": args,
         }
@@ -890,6 +947,14 @@ You are an AI assistant specialized in automatically setting up a given project 
 
         _LOG.info(f"[CYCLE] Phase 2: Executing action...")
         raw = self._execute_action(name, args)
+        # Record the cycle right away, before summarising: a summariser failure must
+        # not lose the fact that this tool ran (the exit artifacts depend on it).
+        executed = getattr(self, "last_executed_command", None) if name == "linux_terminal" else None
+        self.last_executed_command = None
+        self.command_history.append(
+            {"cycle": self.cycle_count, "tool": name, "args": _slim_args(name, args),
+             "executed_command": executed, "returncode": raw["returncode"]}
+        )
         _LOG.info(f"[CYCLE] Phase 2 complete: output length={len(raw.get('output', ''))}")
 
         _LOG.info(f"[CYCLE] Phase 3: Summarizing output...")
