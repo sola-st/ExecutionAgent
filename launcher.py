@@ -42,6 +42,7 @@ class Project:
     url: str
     language: str
     image_tag: str
+    commit: str = ""          # commit SHA to check out; empty means default branch HEAD
 
     @property
     def safe_name(self) -> str:
@@ -139,6 +140,7 @@ def create_metadata_file(project: Project, output_dir: Path, budget: int = 40) -
         "project_url": project.url,
         "language": project.language,
         "image_tag": project.image_tag,
+        "commit": project.commit,           # checked out by the agent; empty = HEAD
         "budget": budget,                   # Step limit per attempt
         "created_at": datetime.now().isoformat(),
     }
@@ -226,6 +228,7 @@ class AgentRunner:
         self,
         workspace_root: Path,
         model: str = "gpt-4o-mini",
+        knowledge_model: Optional[str] = None,
         step_limit: int = 40,
         max_retries: int = 2,
         parallel: int = 1,
@@ -234,6 +237,7 @@ class AgentRunner:
     ):
         self.workspace_root = workspace_root
         self.model = model
+        self.knowledge_model = knowledge_model
         self.step_limit = step_limit
         self.max_retries = max_retries
         self.parallel = parallel
@@ -282,6 +286,8 @@ class AgentRunner:
             "--model", self.model,
             "--max-retries", str(self.max_retries),
         ]
+        if self.knowledge_model:
+            cmd += ["--knowledge-model", self.knowledge_model]
 
         print(f"\n{'=' * 60}")
         print(f"Starting: {project.name} ({project.language})")
@@ -502,6 +508,12 @@ Examples:
         help="Model to use (default: gpt-4o-mini)",
     )
     parser.add_argument(
+        "--knowledge-model",
+        type=str,
+        default=None,
+        help="Knowledge model for web search/summaries (passed through to the agent)",
+    )
+    parser.add_argument(
         "--step-limit", "-s",
         type=int,
         default=40,
@@ -609,6 +621,7 @@ def main() -> int:
         runner = AgentRunner(
             workspace_root=workspace_root,
             model=args.model,
+            knowledge_model=args.knowledge_model,
             step_limit=args.step_limit,
             max_retries=args.max_retries,
             parallel=args.parallel,

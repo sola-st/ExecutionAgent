@@ -27,21 +27,25 @@ def _escape_bash_string(s: str) -> str:
 
 def _extract_dockerfile_content(agent: Any) -> Optional[str]:
     """
-    Extract the Dockerfile content from the agent's written_files.
+    Extract the Dockerfile content from the agent.
+
+    Prefers agent.base_dockerfile, which is only set once a Dockerfile has
+    successfully built an image and started a container. Falls back to the most
+    recently written Dockerfile, since earlier ones may have failed to build.
 
     Returns:
         The Dockerfile content if found, None otherwise.
     """
+    # Prefer the Dockerfile that actually built and started a container
+    if getattr(agent, "base_dockerfile", None):
+        return agent.base_dockerfile
+
     written_files = getattr(agent, "written_files", [])
 
-    for target_name, location, actual_path, content in written_files:
+    for target_name, location, actual_path, content in reversed(written_files):
         # Check if this is a Dockerfile
         if target_name.lower() == "dockerfile" or target_name.lower().endswith(".dockerfile"):
             return content
-
-    # Also check if stored directly on agent
-    if hasattr(agent, "base_dockerfile") and agent.base_dockerfile:
-        return agent.base_dockerfile
 
     return None
 
@@ -117,6 +121,7 @@ def _generate_launch_script(
     commands_script_path: str,
     project_path: str,
     docker_tag: str = "",
+    project_url: str = "",
 ) -> str:
     """
     Generate a launch.sh script that builds the Docker image and runs the commands.
@@ -126,6 +131,8 @@ def _generate_launch_script(
         commands_script_path: Path to the commands script (relative to launch.sh)
         project_path: The project path for context
         docker_tag: Optional custom docker tag
+        project_url: Repository URL, passed as the REPO_URL build arg to mirror the
+            agent's own build (generated Dockerfiles often declare `ARG REPO_URL`)
 
     Returns:
         Launch script content
@@ -169,6 +176,8 @@ def _generate_launch_script(
     lines.append("")
     lines.append("# Configuration")
     lines.append(f"DOCKER_TAG='{_escape_bash_string(tag)}'")
+    if project_url:
+        lines.append(f"REPO_URL='{_escape_bash_string(project_url)}'")
     lines.append(f'DOCKERFILE_PATH="$SCRIPT_DIR/{dockerfile_path}"')
     lines.append(f'COMMANDS_SCRIPT="$SCRIPT_DIR/{commands_script_path}"')
     lines.append('CONTAINER_ID=""')
@@ -196,7 +205,12 @@ def _generate_launch_script(
     lines.append("echo ''")
     lines.append("")
     lines.append('DOCKERFILE_DIR="$(dirname "$DOCKERFILE_PATH")"')
-    lines.append('docker build -t "$DOCKER_TAG" "$DOCKERFILE_DIR"')
+    if project_url:
+        # Harmless if the Dockerfile hardcodes the URL: docker only warns about
+        # build args it does not declare.
+        lines.append('docker build --build-arg REPO_URL="$REPO_URL" -t "$DOCKER_TAG" "$DOCKERFILE_DIR"')
+    else:
+        lines.append('docker build -t "$DOCKER_TAG" "$DOCKERFILE_DIR"')
     lines.append("")
     lines.append("BUILD_STATUS=$?")
     lines.append("if [ $BUILD_STATUS -ne 0 ]; then")
@@ -319,6 +333,7 @@ def generate_exit_artifacts(
         commands_script_path="commands.sh",
         project_path=project_path,
         docker_tag=docker_tag,
+        project_url=str(getattr(agent, "project_url", "") or ""),
     )
     launch_path = artifacts_dir / "launch.sh"
     launch_path.write_text(launch_script, encoding="utf-8")
