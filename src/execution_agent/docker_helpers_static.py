@@ -8,6 +8,7 @@ XML conversion, etc. to avoid code duplication.
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 import time
 import uuid
@@ -22,6 +23,8 @@ except Exception:  # pragma: no cover
 
 # Import shared utilities
 from execution_agent.shared_utils import (
+    screen_staging_script,
+    stuff_escape,
     exec_in_container,
     read_file_tail,
     read_file_from_container,
@@ -323,19 +326,13 @@ def exec_in_screen_and_get_log(container: DockerContainer, cmd: str) -> Tuple[in
         return 0, "The shell has been renewed (exec /bin/bash -l).", logfile, False
 
     # Write script
-    _exec(
-        container,
-        f"cat > {shlex.quote(script)} <<'{delim}'\n{cmd}\n{delim}\nchmod +x {shlex.quote(script)}"
-    )
-    _exec(container, f": > {shlex.quote(logfile)}")
-
-    payload = (
-        f'printf "%s\\n" "{BEGIN}" >> {logfile}; '
-        f'if . {script} >> {logfile} 2>&1; then __rc=0; else __rc=$?; fi; '
-        f'printf "%s\\n" "{END}" >> {logfile}; '
-        f'printf "<<RC:{run_id}:%d>>\\n" "$__rc" >> {logfile}'
-    )
-    _stuff_single_quoted(payload)
+    # screen's `stuff` expands $NAME in typed text, which made `$__rc` empty and every
+    # exit code 0. Only the wrapper invocation is typed; see shared_utils.
+    wrapper, staging = screen_staging_script(run_id, logfile, script, cmd, source=True)
+    stage_rc, stage_out = _exec(container, staging)
+    if stage_rc != 0:
+        return 1, f"Could not stage the command inside the container (docker exec failed): {stage_out.strip()[:300]}", logfile, False
+    _stuff_single_quoted(f". {wrapper}")
 
     last_buf = ""
     last_change = time.time()
@@ -534,8 +531,7 @@ def handle_stuck_action(agent: Any, command: str) -> Optional[str]:
 
     if cmd.startswith("WRITE:"):
         user_input = cmd.split("WRITE:", 1)[1]
-        safe = user_input.replace("'", r"'\''")
-        _exec(container, f"screen -S {shlex.quote(SCREEN_SESSION)} -X stuff '{safe}\\r'")
+        _exec(container, f"screen -S {shlex.quote(SCREEN_SESSION)} -X stuff '{stuff_escape(user_input)}\\r'")
         finished, output = _progress_aware_wait(after_write=True)
         if finished:
             agent.command_stuck = False
